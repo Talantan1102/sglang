@@ -91,9 +91,6 @@ def _init_disagg_prefill_npu_profiler() -> object:
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
             str(profiling_path)
         ),
-        schedule=torch_npu.profiler.schedule(
-            wait=1, warmup=1, active=10, repeat=1, skip_first=1
-        ),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
