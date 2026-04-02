@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from pathlib import Path
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -42,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -60,6 +62,105 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _init_disagg_prefill_npu_profiler() -> object:
+    import torch_npu
+
+    profiling_path = (
+        Path(envs.SGLANG_TORCH_PROFILER_DIR.get()).expanduser()
+        / "disagg_prefill_profiling"
+    )
+    profiling_path.mkdir(parents=True, exist_ok=True)
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        l2_cache=False,
+        data_simplification=False,
+    )
+    logger.info(
+        "Enable disaggregation prefill profiling. Traces will be saved to: %s",
+        profiling_path,
+    )
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+            str(profiling_path)
+        ),
+        schedule=torch_npu.profiler.schedule(
+            wait=1, warmup=1, active=10, repeat=1, skip_first=1
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    )
+
+
+def _init_disagg_prefill_profiling_state(
+    self: "Scheduler",
+) -> tuple[bool, int, int, object | None, bool, int]:
+    enable_profiling = (
+        envs.SGLANG_NPU_PROFILING.get()
+        and self.tp_rank == 0
+        and hasattr(torch, "npu")
+    )
+    prof_tokens = envs.SGLANG_NPU_PROFILING_TOKENS.get()
+    prof_step = envs.SGLANG_NPU_PROFILING_STEP.get()
+    prof = _init_disagg_prefill_npu_profiler() if enable_profiling else None
+    return enable_profiling, prof_tokens, prof_step, prof, False, 0
+
+
+def _maybe_start_disagg_prefill_profiling(
+    batch: "ScheduleBatch",
+    enable_profiling: bool,
+    prof: object | None,
+    prof_started: bool,
+    prof_tokens: int,
+) -> bool:
+    if not enable_profiling or prof is None or prof_started:
+        return prof_started
+
+    batch_tokens = batch.extend_num_tokens or 0
+
+    if prof_tokens > 0 and batch_tokens >= prof_tokens:
+        logger.info(
+            "Start disaggregation prefill profiling at extend_tokens=%s",
+            batch_tokens,
+        )
+        prof.start()
+        return True
+
+    return prof_started
+
+
+def _step_disagg_prefill_profiling(
+    enable_profiling: bool,
+    prof: object | None,
+    prof_started: bool,
+    prof_cnt: int,
+    prof_step: int,
+) -> tuple[bool, int]:
+    if not enable_profiling or prof is None or not prof_started:
+        return prof_started, prof_cnt
+
+    prof.step()
+    prof_cnt += 1
+    if prof_cnt >= prof_step:
+        torch.npu.synchronize()
+        prof.stop()
+        logger.info(
+            "Stop disaggregation prefill profiling after %s prof steps", prof_cnt
+        )
+        return False, prof_cnt
+
+    return prof_started, prof_cnt
 
 
 def release_req_to_metadata_buffer(
@@ -356,6 +457,9 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        enable_profiling, prof_tokens, prof_step, prof, prof_started, prof_cnt = (
+            _init_disagg_prefill_profiling_state(self)
+        )
 
         while True:
             # Receive requests
@@ -371,8 +475,22 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                prof_started = _maybe_start_disagg_prefill_profiling(
+                    batch,
+                    enable_profiling,
+                    prof,
+                    prof_started,
+                    prof_tokens,
+                )
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                prof_started, prof_cnt = _step_disagg_prefill_profiling(
+                    enable_profiling,
+                    prof,
+                    prof_started,
+                    prof_cnt,
+                    prof_step,
+                )
             else:
                 self.self_check_during_idle()
 
@@ -384,6 +502,9 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        enable_profiling, prof_tokens, prof_step, prof, prof_started, prof_cnt = (
+            _init_disagg_prefill_profiling_state(self)
+        )
 
         while True:
             # Receive requests
@@ -399,8 +520,22 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                prof_started = _maybe_start_disagg_prefill_profiling(
+                    batch,
+                    enable_profiling,
+                    prof,
+                    prof_started,
+                    prof_tokens,
+                )
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                prof_started, prof_cnt = _step_disagg_prefill_profiling(
+                    enable_profiling,
+                    prof,
+                    prof_started,
+                    prof_cnt,
+                    prof_step,
+                )
             else:
                 batch_result = None
 
