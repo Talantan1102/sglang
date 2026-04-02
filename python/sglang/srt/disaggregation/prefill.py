@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _init_disagg_prefill_npu_profiler() -> object:
+def _init_disagg_prefill_npu_profiler(prof_step: int) -> object:
     import torch_npu
 
     profiling_path = (
@@ -91,6 +91,9 @@ def _init_disagg_prefill_npu_profiler() -> object:
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
             str(profiling_path)
         ),
+        schedule=torch_npu.profiler.schedule(
+            skip_first=0, wait=0, warmup=0, active=prof_step, repeat=1
+        ),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
@@ -110,7 +113,7 @@ def _init_disagg_prefill_profiling_state(
     )
     prof_tokens = envs.SGLANG_NPU_PROFILING_TOKENS.get()
     prof_step = envs.SGLANG_NPU_PROFILING_STEP.get()
-    prof = _init_disagg_prefill_npu_profiler() if enable_profiling else None
+    prof = _init_disagg_prefill_npu_profiler(prof_step) if enable_profiling else None
     return enable_profiling, prof_tokens, prof_step, prof, False, 0
 
 
