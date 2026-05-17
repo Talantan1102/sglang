@@ -67,6 +67,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_current_device_stream_fast,
     log_info_on_rank0,
     make_layers,
 )
@@ -648,12 +649,28 @@ class MQALayer(nn.Module):
             )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector: torch.cuda.current_stream() is
+            # not callable on Ascend NPU. get_current_device_stream_fast()
+            # routes via torch.get_device_module() to npu.current_stream on
+            # NPU and cuda.current_stream on CUDA.
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv before store_cache: cp_size={self.cp_size}, "
+                    f"kv_local.shape={tuple(kv.shape)}, dtype={kv.dtype}, device={kv.device}",
+                )
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv after: kv_full.shape={tuple(kv.shape)} "
+                    f"(expected first dim = cp_size * local = {self.cp_size} * <local>)",
+                )
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -1171,11 +1188,22 @@ class DeepseekV4Model(nn.Module):
             )
 
         if nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector — see comment in MQALayer
+            # _forward_prepare on the matching cp_all_gather call.
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states pre-hc_head: cp_size={self.cp_size}, "
+                f"local.shape={tuple(hidden_states.shape)}",
+            )
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
+            )
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states after: full.shape={tuple(hidden_states.shape)}",
             )
 
         pre_hc_head = hidden_states.flatten(1)
@@ -1266,14 +1294,47 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
                 if is_nsa_prefill_cp_round_robin_split():
                     metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                    # The CUDA DSV4 backend exposes a `core_attn_metadata` field
+                    # with apply_cp_reindex() / init_flashmla_related(). The
+                    # Ascend DeepseekV4AscendAttnBackend does its rank-local
+                    # reindex inside init_forward_metadata (see
+                    # deepseek_v4_ascend_backend.py CP sanity block), so the
+                    # CUDA-specific reindex calls do not apply on NPU. Guard
+                    # by feature-detection on the metadata object to keep both
+                    # paths in one branch.
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None and hasattr(core_meta, "apply_cp_reindex"):
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] CUDA reindex path: cp_size={self.cp_size}, "
+                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}",
+                        )
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related()
+                        if metadata.indexer_metadata is not None:
+                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
+                    else:
+                        # NPU path: rank-local Q metadata is pre-computed in
+                        # init_forward_metadata (deepseek_v4_ascend_backend.py)
+                        # by dividing extend_seq_lens_cpu by cp_size before
+                        # building actual_seq_lengths_q / kernel_metadata.
+                        # Nothing extra to do here; assert the backend opted in.
+                        assert getattr(
+                            forward_batch.attn_backend, "supports_v4_cp", False
+                        ), (
+                            "DSV4 NSA prefill CP active but attn_backend "
+                            f"{type(forward_batch.attn_backend).__name__} has "
+                            "neither core_attn_metadata.apply_cp_reindex nor "
+                            "supports_v4_cp. CP cannot run safely."
+                        )
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] NPU path (supports_v4_cp): cp_size={self.cp_size}, "
+                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}. "
+                            f"Rank-local Q / global KV reindex handled in backend "
+                            f"init_forward_metadata sanity hook.",
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
