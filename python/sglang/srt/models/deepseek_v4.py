@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
@@ -67,6 +68,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_current_device_stream_fast,
     log_info_on_rank0,
     make_layers,
 )
@@ -648,12 +650,28 @@ class MQALayer(nn.Module):
             )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector: torch.cuda.current_stream() is
+            # not callable on Ascend NPU. get_current_device_stream_fast()
+            # routes via torch.get_device_module() to npu.current_stream on
+            # NPU and cuda.current_stream on CUDA.
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv before store_cache: cp_size={self.cp_size}, "
+                    f"kv_local.shape={tuple(kv.shape)}, dtype={kv.dtype}, device={kv.device}",
+                )
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv after: kv_full.shape={tuple(kv.shape)} "
+                    f"(expected first dim = cp_size * local = {self.cp_size} * <local>)",
+                )
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -1171,11 +1189,22 @@ class DeepseekV4Model(nn.Module):
             )
 
         if nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector — see comment in MQALayer
+            # _forward_prepare on the matching cp_all_gather call.
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states pre-hc_head: cp_size={self.cp_size}, "
+                f"local.shape={tuple(hidden_states.shape)}",
+            )
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
+            )
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states after: full.shape={tuple(hidden_states.shape)}",
             )
 
         pre_hc_head = hidden_states.flatten(1)
@@ -1264,16 +1293,68 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                if is_nsa_prefill_cp_round_robin_split():
+                if (
+                    is_nsa_prefill_cp_round_robin_split()
+                    or is_nsa_prefill_cp_in_seq_split()
+                ):
                     metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                    # The CUDA DSV4 backend exposes a `core_attn_metadata` field
+                    # with apply_cp_reindex() / init_flashmla_related(). That
+                    # CUDA reindex is round-robin specific (uniform-split
+                    # remap); in-seq-split has its own per-half metadata path
+                    # built in the backend's init_forward_metadata, so we only
+                    # invoke the CUDA reindex for round-robin.
+                    #
+                    # The Ascend DeepseekV4AscendAttnBackend handles both
+                    # round-robin (uniform-split sanity) and in-seq-split
+                    # (zigzag halves + prev/next kernel_metadata) inside its
+                    # own init_forward_metadata. Guard by feature-detection on
+                    # the metadata object to keep CUDA + NPU paths in one
+                    # branch.
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if (
+                        is_nsa_prefill_cp_round_robin_split()
+                        and core_meta is not None
+                        and hasattr(core_meta, "apply_cp_reindex")
+                    ):
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] CUDA reindex path: cp_size={self.cp_size}, "
+                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}",
+                        )
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related()
+                        if metadata.indexer_metadata is not None:
+                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
+                    else:
+                        # NPU path (round-robin or in-seq) — and CUDA in-seq
+                        # (no apply_cp_reindex on core_attn_metadata for that
+                        # path yet). Rank-local Q + KV metadata is handled by
+                        # the V4 Ascend backend's init_forward_metadata. Assert
+                        # the backend opted in to avoid silent divergence if a
+                        # new MLA backend lands without CP wiring.
+                        assert getattr(
+                            forward_batch.attn_backend, "supports_v4_cp", False
+                        ), (
+                            "DSV4 NSA prefill CP active but attn_backend "
+                            f"{type(forward_batch.attn_backend).__name__} has "
+                            "neither core_attn_metadata.apply_cp_reindex nor "
+                            "supports_v4_cp. CP cannot run safely."
+                        )
+                        cp_mode = (
+                            "round-robin"
+                            if is_nsa_prefill_cp_round_robin_split()
+                            else "in-seq"
+                        )
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] NPU path (supports_v4_cp, mode={cp_mode}): "
+                            f"cp_size={self.cp_size}, rank={self.cp_rank}, "
+                            f"backend={type(forward_batch.attn_backend).__name__}. "
+                            f"Rank-local Q / KV metadata handled in backend "
+                            f"init_forward_metadata sanity hook.",
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
