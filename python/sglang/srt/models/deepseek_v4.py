@@ -648,12 +648,24 @@ class MQALayer(nn.Module):
             )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            if self.layer_id == 1:
+                log_info_on_rank0(
+                    logger,
+                    f"[NSA_CP][MQALayer._forward_prepare] layer_id={self.layer_id} "
+                    f"cp_size={self.cp_size} kv all-gather in.shape={tuple(kv.shape)}",
+                )
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if self.layer_id == 1:
+                log_info_on_rank0(
+                    logger,
+                    f"[NSA_CP][MQALayer._forward_prepare] layer_id={self.layer_id} "
+                    f"kv post-gather.shape={tuple(kv.shape)}",
+                )
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -1010,6 +1022,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        if self.layer_id == 1:
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][DecoderLayer.forward] layer_id={self.layer_id} "
+                f"_use_cp={_use_cp} nsa_enable_prefill_cp={self.nsa_enable_prefill_cp} "
+                f"hidden_states.shape={tuple(hidden_states.shape)}",
+            )
         _use_tp_moe_gather = (
             not _use_cp
             and get_attention_dp_size() > 1
@@ -1028,8 +1047,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             cp_rank = get_attention_cp_rank()
             cp_size = get_attention_cp_size()
+            _input_ids_before = input_ids.shape
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
+            if self.layer_id == 1:
+                log_info_on_rank0(
+                    logger,
+                    f"[NSA_CP][DecoderLayer.forward] layer_id={self.layer_id} "
+                    f"cp_rank={cp_rank} cp_size={cp_size} "
+                    f"input_ids slice {tuple(_input_ids_before)} -> {tuple(input_ids.shape)}",
+                )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
@@ -1157,8 +1184,20 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][Model.forward] pre-layer split: cp_size={self.cp_size} "
+                f"hidden_states.shape={tuple(hidden_states.shape)} "
+                f"positions.shape={tuple(positions.shape)}",
+            )
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][Model.forward] post-split "
+                f"hidden_states.shape={tuple(hidden_states.shape)} "
+                f"positions.shape={tuple(positions.shape)}",
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1171,11 +1210,21 @@ class DeepseekV4Model(nn.Module):
             )
 
         if nsa_use_prefill_cp(forward_batch):
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][Model.forward] post-layer all-gather: "
+                f"cp_size={self.cp_size} in.shape={tuple(hidden_states.shape)}",
+            )
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][Model.forward] post-gather "
+                f"hidden_states.shape={tuple(hidden_states.shape)}",
             )
 
         pre_hc_head = hidden_states.flatten(1)
@@ -1257,23 +1306,62 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            _can_split = can_nsa_cp_split(
+                len(input_ids), self.cp_size, True, forward_batch
+            )
+            log_info_on_rank0(
+                logger,
+                f"[NSA_CP][CausalLM.forward] cp_rank={self.cp_rank} "
+                f"cp_size={self.cp_size} num_input_ids={len(input_ids)} "
+                f"forward_mode={getattr(forward_batch, 'forward_mode', None)} "
+                f"can_split={_can_split} "
+                f"round_robin={is_nsa_prefill_cp_round_robin_split()}",
+            )
+            if _can_split:
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                log_info_on_rank0(
+                    logger,
+                    f"[NSA_CP][CausalLM.forward] prepared attn_cp_metadata "
+                    f"(cp_rank={self.cp_rank} "
+                    f"seq_lens={forward_batch.seq_lens_cpu.tolist()})",
+                )
                 if is_nsa_prefill_cp_round_robin_split():
                     metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None and hasattr(core_meta, "apply_cp_reindex"):
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related()
+                        if metadata.indexer_metadata is not None:
+                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
+                        log_info_on_rank0(
+                            logger,
+                            f"[NSA_CP][CausalLM.forward] CUDA path applied "
+                            f"round-robin reindex (cp_rank={self.cp_rank} "
+                            f"indexer_metadata={metadata.indexer_metadata is not None})",
+                        )
+                    else:
+                        assert getattr(
+                            forward_batch.attn_backend, "supports_v4_cp", False
+                        ) or type(forward_batch.attn_backend).__name__.startswith(
+                            "NativeSparseAttn"
+                        ), (
+                            "DSV4 NSA prefill CP active but attn_backend "
+                            f"{type(forward_batch.attn_backend).__name__} has "
+                            "neither core_attn_metadata.apply_cp_reindex nor "
+                            "supports_v4_cp. CP cannot run safely."
+                        )
+                        log_info_on_rank0(
+                            logger,
+                            f"[NSA_CP][CausalLM.forward] NPU/NSA path: rank-local "
+                            f"reindex handled inside attn_backend.init_forward_metadata "
+                            f"(backend={type(forward_batch.attn_backend).__name__})",
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
