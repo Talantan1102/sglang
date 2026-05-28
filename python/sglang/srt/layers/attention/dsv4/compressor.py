@@ -426,7 +426,9 @@ class Compressor(nn.Module):
                 envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
                 and forward_batch.forward_mode.is_decode()
             ):
-                return self._forward_npu_fused(x, forward_batch.positions, forward_batch)
+                return self._forward_npu_fused(
+                    x, forward_batch.positions, forward_batch
+                )
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
@@ -495,9 +497,9 @@ class Compressor(nn.Module):
         split = coff * self.head_dim
         # wkv_gate.weight shape: [2*coff*head_dim, hidden_size]. Split row-wise.
         w = self.wkv_gate.weight
-        assert w.shape[0] == 2 * split, (
-            f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
-        )
+        assert (
+            w.shape[0] == 2 * split
+        ), f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
         self._fused_wkv_w = w[:split]
         self._fused_wgate_w = w[split:]
         self._fused_norm_weight_bf16 = self.norm.weight.to(torch.bfloat16)
@@ -646,6 +648,8 @@ class Compressor(nn.Module):
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         is_prefill = forward_batch.forward_mode.is_prefill()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
@@ -680,110 +684,148 @@ class Compressor(nn.Module):
             if seqlen == 0:
                 continue
             if is_prefill:
-                pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
-
-                # Per-req tail-only state alloc range. Same formula as
-                # ScheduleBatch._compute_dsv4_state_lens_extend; recomputed
-                # here to avoid threading another tensor through forward_batch.
-                tail_128 = seqlen % 128
-                if ratio == 4:
-                    c_alloc_len = (
-                        tail_128 + 128
-                        if (tail_128 <= 3 and seqlen >= 128)
-                        else tail_128
-                    )
-                else:  # ratio == 128
-                    c_alloc_len = tail_128
-                c_alloc_offset = seqlen - c_alloc_len
-
-                # Bundle slice for this req. The NPU paged state pool emits
-                # real slot ids in the bundle (no ring-hash); slice by
-                # ``state_bundle_offset`` (cumulative alloc_len across reqs),
-                # NOT by ``seqlen_offset`` (cumulative raw seqlen).
-                bundle = forward_batch.out_cache_loc_dsv4
-                assert bundle is not None, (
-                    "Compressor.forward_npu prefill on NPU needs the DSV4 "
-                    "alloc bundle; expected maybe_write_dsv4_extend to have "
-                    "populated batch.out_cache_loc_dsv4 before forward."
+                # Chunked-prefill aware lengths. ``chunk_len`` is what's
+                # actually in kv_full / score_full for this req in the
+                # current batch; ``prefix_len`` is what's already in the
+                # KV / state pools from previous batches.
+                chunk_len = (
+                    int(extend_seq_lens_cpu[idx])
+                    if extend_seq_lens_cpu is not None
+                    else seqlen
                 )
-                bundle_state_loc = (
-                    bundle.out_c4_state_loc
-                    if ratio == 4
-                    else bundle.out_c128_state_loc
+                prefix_len = (
+                    int(extend_prefix_lens_cpu[idx])
+                    if extend_prefix_lens_cpu is not None
+                    else 0
                 )
-                assert bundle_state_loc is not None and bundle_state_loc.numel() > 0, (
-                    f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
-                    f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
-                    f"c{ratio}_state_attn_allocator was not initialized (check "
-                    f"pool_configurator's NPU branch + npu_state_pool_size)."
-                )
-                out_cache_loc = bundle_state_loc[
-                    state_bundle_offset : state_bundle_offset + c_alloc_len
-                ]
-                state_bundle_offset += c_alloc_len
-                remainder = seqlen % ratio
-                cutoff = seqlen - remainder
-                # ``cutoff`` in raw coords; subtract ``c_alloc_offset`` for
-                # slice-relative indexing into the per-req bundle slice.
-                cutoff_in_slice = cutoff - c_alloc_offset
-                should_compress = cutoff >= ratio
-                # ratio-strided positions for the cutoff chunks (one rope
-                # position per compressed token).
-                pos_compressed = pos_req[:cutoff:ratio]
-                kv = kv_full[seqlen_offset : seqlen_offset + seqlen]
-                score = score_full[seqlen_offset : seqlen_offset + seqlen]
 
-                if overlap and cutoff >= ratio:
-                    # Stash the trailing ratio tokens of the cutoff so the
-                    # next decode step can do overlap compression across the
-                    # boundary. State alloc covers [cutoff - ratio, seqlen)
-                    # for ratio=4 by construction (formula picks tail+128 or
-                    # tail; in both cases the [cutoff-ratio, cutoff) window
-                    # is inside [alloc_offset, seqlen)).
-                    kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
-                    score_state_to_be_cached.append(
-                        score[cutoff - ratio : cutoff] + self.ape
-                    )
-                    state_loc_list.append(
-                        out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
-                    )
-                if remainder > 0:
-                    kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
-                    score_cut, score_rem = score.split([cutoff, remainder], dim=0)
-                    kv_state_to_be_cached.append(kv_rem)
-                    score_state_to_be_cached.append(score_rem + self.ape[:remainder])
-                    state_loc_list.append(out_cache_loc[-remainder:])
-                    kv = kv_cut
-                    score = score_cut
+                if prefix_len == 0:
+                    # ---- Fast path: non-chunked prefill OR first chunk of
+                    # a chunked request. All compress inputs live within
+                    # the current chunk so no state-ring reads are needed.
+                    pos_req = positions[seqlen_offset : seqlen_offset + chunk_len]
 
-                if should_compress:
-                    kv = kv.unflatten(0, (-1, ratio))  # [n_chunks, ratio, coff*d]
-                    score = score.unflatten(0, (-1, ratio)) + self.ape
-                    if overlap:
-                        kv = self._overlap_transform(kv, value=0.0)
-                        score = self._overlap_transform(score, value=float("-inf"))
-                    kv_compressed = (kv * score.softmax(dim=1)).sum(
-                        dim=1
-                    )  # [n_chunks, d]
-                    n_compressed_this_req = kv_compressed.shape[0]
-                    kv_out_list.append(kv_compressed)
-                    kv_out_positions.append(pos_compressed)
-                    write_req_indices.append(
-                        torch.full(
-                            (n_compressed_this_req,),
-                            idx,
-                            dtype=torch.int64,
-                            device=device,
+                    # Per-req tail-only state alloc range. Same formula as
+                    # ScheduleBatch._compute_dsv4_state_lens_extend; recomputed
+                    # here to avoid threading another tensor through forward_batch.
+                    tail_128 = chunk_len % 128
+                    if ratio == 4:
+                        c_alloc_len = (
+                            tail_128 + 128
+                            if (tail_128 <= 3 and chunk_len >= 128)
+                            else tail_128
                         )
+                    else:  # ratio == 128
+                        c_alloc_len = tail_128
+                    c_alloc_offset = chunk_len - c_alloc_len
+
+                    # Bundle slice for this req. The NPU paged state pool emits
+                    # real slot ids in the bundle (no ring-hash); slice by
+                    # ``state_bundle_offset`` (cumulative alloc_len across reqs),
+                    # NOT by ``seqlen_offset`` (cumulative raw seqlen).
+                    bundle = forward_batch.out_cache_loc_dsv4
+                    assert bundle is not None, (
+                        "Compressor.forward_npu prefill on NPU needs the DSV4 "
+                        "alloc bundle; expected maybe_write_dsv4_extend to have "
+                        "populated batch.out_cache_loc_dsv4 before forward."
                     )
-                    write_pos_in_req.append(
-                        torch.arange(
-                            n_compressed_this_req,
-                            dtype=torch.int64,
-                            device=device,
+                    bundle_state_loc = (
+                        bundle.out_c4_state_loc
+                        if ratio == 4
+                        else bundle.out_c128_state_loc
+                    )
+                    assert (
+                        bundle_state_loc is not None and bundle_state_loc.numel() > 0
+                    ), (
+                        f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
+                        f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
+                        f"c{ratio}_state_attn_allocator was not initialized (check "
+                        f"pool_configurator's NPU branch + npu_state_pool_size)."
+                    )
+                    out_cache_loc = bundle_state_loc[
+                        state_bundle_offset : state_bundle_offset + c_alloc_len
+                    ]
+                    state_bundle_offset += c_alloc_len
+                    remainder = chunk_len % ratio
+                    cutoff = chunk_len - remainder
+                    # ``cutoff`` in raw coords; subtract ``c_alloc_offset`` for
+                    # slice-relative indexing into the per-req bundle slice.
+                    cutoff_in_slice = cutoff - c_alloc_offset
+                    should_compress = cutoff >= ratio
+                    pos_compressed = pos_req[:cutoff:ratio]
+                    kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
+                    score = score_full[seqlen_offset : seqlen_offset + chunk_len]
+
+                    if overlap and cutoff >= ratio:
+                        kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
+                        score_state_to_be_cached.append(
+                            score[cutoff - ratio : cutoff] + self.ape
                         )
+                        state_loc_list.append(
+                            out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
+                        )
+                    if remainder > 0:
+                        kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
+                        score_cut, score_rem = score.split([cutoff, remainder], dim=0)
+                        kv_state_to_be_cached.append(kv_rem)
+                        score_state_to_be_cached.append(
+                            score_rem + self.ape[:remainder]
+                        )
+                        state_loc_list.append(out_cache_loc[-remainder:])
+                        kv = kv_cut
+                        score = score_cut
+
+                    if should_compress:
+                        kv = kv.unflatten(0, (-1, ratio))
+                        score = score.unflatten(0, (-1, ratio)) + self.ape
+                        if overlap:
+                            kv = self._overlap_transform(kv, value=0.0)
+                            score = self._overlap_transform(score, value=float("-inf"))
+                        kv_compressed = (kv * score.softmax(dim=1)).sum(dim=1)
+                        n_compressed_this_req = kv_compressed.shape[0]
+                        kv_out_list.append(kv_compressed)
+                        kv_out_positions.append(pos_compressed)
+                        write_req_indices.append(
+                            torch.full(
+                                (n_compressed_this_req,),
+                                idx,
+                                dtype=torch.int64,
+                                device=device,
+                            )
+                        )
+                        write_pos_in_req.append(
+                            torch.arange(
+                                n_compressed_this_req,
+                                dtype=torch.int64,
+                                device=device,
+                            )
+                        )
+                else:
+                    # ---- Triton path: chunked prefill follow-up
+                    # (prefix_len > 0). The kernel derives state/chunk
+                    # sources directly from prefix_len/chunk_len and avoids
+                    # CPU-side layout materialization.
+                    self._npu_prefill_chunked_one_req(
+                        idx=idx,
+                        prefix_len=prefix_len,
+                        chunk_len=chunk_len,
+                        seqlen_offset=seqlen_offset,
+                        kv_full=kv_full,
+                        score_full=score_full,
+                        forward_batch=forward_batch,
+                        page_table=page_table,
+                        token_to_kv_pool=token_to_kv_pool,
+                        kv_out_list=kv_out_list,
+                        kv_out_positions=kv_out_positions,
+                        kv_state_to_be_cached=kv_state_to_be_cached,
+                        score_state_to_be_cached=score_state_to_be_cached,
+                        state_loc_list=state_loc_list,
+                        write_req_indices=write_req_indices,
+                        write_pos_in_req=write_pos_in_req,
+                        device=device,
                     )
-                seqlen_offset += seqlen
+
+                seqlen_offset += chunk_len
             else:
                 # Decode: one token per request. Append (kv, score+ape[pos%r])
                 # to the state ring at c{4,128}_state_loc[idx]; if this token
@@ -882,6 +924,7 @@ class Compressor(nn.Module):
             # why (.real / .imag on a complex tensor are strided views and
             # aclnnIndex over them triggers StridedSlice materialization).
             from sglang.srt.models.deepseek_v4 import _get_contig_freqs_real_imag
+
             freqs_real, freqs_imag = _get_contig_freqs_real_imag(self.freqs_cis)
             cos_half = freqs_real[pos_out].to(kv_out.dtype)
             sin_half = freqs_imag[pos_out].to(kv_out.dtype)
@@ -920,6 +963,118 @@ class Compressor(nn.Module):
             ].to(torch.int32)
             self._compressor_epilog_npu(kv_out, forward_batch, override_loc=write_locs)
         return None
+
+    def _npu_prefill_chunked_one_req(
+        self,
+        *,
+        idx: int,
+        prefix_len: int,
+        chunk_len: int,
+        seqlen_offset: int,
+        kv_full: torch.Tensor,
+        score_full: torch.Tensor,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        token_to_kv_pool,
+        kv_out_list: list,
+        kv_out_positions: list,
+        kv_state_to_be_cached: list,
+        score_state_to_be_cached: list,
+        state_loc_list: list,
+        write_req_indices: list,
+        write_pos_in_req: list,
+        device: torch.device,
+    ) -> None:
+        """Triton compress for one chunked-prefill request (prefix_len > 0)."""
+        from sgl_kernel_npu.attention.dsv4_chunked_compress import (
+            dsv4_chunked_prefill_compress,
+        )
+
+        ratio = self.ratio
+        overlap = self.overlap
+
+        chunk_kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
+        chunk_score = score_full[seqlen_offset : seqlen_offset + chunk_len]
+        raw_kv_loc_chunk = forward_batch.out_cache_loc[
+            seqlen_offset : seqlen_offset + chunk_len
+        ]
+        chunk_state_loc = token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
+            raw_kv_loc_chunk, ratio
+        )
+        page_size = forward_batch.attn_backend.page_size
+
+        total_len = prefix_len + chunk_len
+        first_k = prefix_len // ratio
+        last_k_exclusive = total_len // ratio
+
+        def stash_range(global_start: int, global_end: int) -> None:
+            if global_end <= global_start:
+                return
+            local_idx = torch.arange(
+                global_start - prefix_len,
+                global_end - prefix_len,
+                dtype=torch.long,
+                device=device,
+            )
+            if local_idx.numel() == 0:
+                return
+            global_pos = local_idx + prefix_len
+            ape_idx = (global_pos % ratio).long()
+            kv_state_to_be_cached.append(chunk_kv[local_idx])
+            score_state_to_be_cached.append(chunk_score[local_idx] + self.ape[ape_idx])
+            state_loc_list.append(chunk_state_loc[local_idx])
+
+        l_cmp = last_k_exclusive * ratio
+        stash_range(max(l_cmp, prefix_len), total_len)
+
+        if overlap and last_k_exclusive > first_k:
+            k_last = last_k_exclusive - 1
+            stash_range(max(k_last * ratio, prefix_len), k_last * ratio + ratio)
+
+        n_out = last_k_exclusive - first_k
+        if n_out == 0:
+            return
+
+        state_pool = self._get_state_pool(forward_batch)
+        state_base = max(0, (first_k - (1 if overlap else 0)) * ratio)
+        if prefix_len > state_base:
+            state_global_pos = torch.arange(
+                state_base,
+                prefix_len,
+                dtype=torch.long,
+                device=device,
+            )
+            state_slots = page_table[idx, state_global_pos // page_size].to(
+                torch.long
+            ) * page_size + (state_global_pos % page_size)
+            state_kv_score_window = state_pool.kv_score_buffer.kv_score[
+                state_slots
+            ].contiguous()
+        else:
+            state_kv_score_window = state_pool.kv_score_buffer.kv_score.new_empty(
+                (0, state_pool.kv_score_buffer.kv_score.shape[-1])
+            )
+        compressed = dsv4_chunked_prefill_compress(
+            chunk_kv.contiguous(),
+            chunk_score.contiguous(),
+            state_kv_score_window,
+            self.ape.contiguous(),
+            prefix_len=prefix_len,
+            chunk_len=chunk_len,
+            ratio=ratio,
+            overlap=overlap,
+            state_base=state_base,
+        )
+        kv_out_list.append(compressed)
+        kv_out_positions.append(
+            (torch.arange(n_out, dtype=torch.long, device=device) + first_k) * ratio
+        )
+        write_req_indices.append(
+            torch.full((n_out,), idx, dtype=torch.int64, device=device)
+        )
+        write_pos_in_req.append(
+            torch.arange(first_k, first_k + n_out, dtype=torch.int64, device=device)
+        )
 
     def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
         # Overlap layout: given (n_chunks, ratio, coff*d), build
