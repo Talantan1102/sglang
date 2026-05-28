@@ -59,6 +59,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        kernel_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -72,6 +73,14 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        # Kernel-view page size for the NPU bf16 buffer. npu_sparse_attn_sharedkv
+        # requires cmp_kv.shape[1] == ori_kv's global page_size, so the c4/c128
+        # pools (whose token-level page_size is page_size // ratio) pass the
+        # global page_size here. Defaults to page_size (swa pool / CUDA path:
+        # no change).
+        self.kernel_page_size = (
+            kernel_page_size if kernel_page_size is not None else page_size
+        )
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -112,9 +121,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         if is_npu_bf16:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.kv_cache_total_dim = kv_dim
+            # Use the GLOBAL kernel_page_size (not the pool's per-ratio
+            # page_size) so cmp_kv.shape[1] == ori_kv.shape[1], which
+            # npu_sparse_attn_sharedkv requires. For the swa pool
+            # kernel_page_size == page_size (no change); for c4/c128 this
+            # widens the native 32/1-slot pages to the global page_size and
+            # removes the reshape workaround in _forward_compressed. Writes are
+            # flat-indexed (set_compress_buffer uses buf.flatten(0,1)[loc]), so
+            # the page granularity only affects shape, not write locations.
+            npu_num_pages = (
+                self.size + self.kernel_page_size + 1
+            ) // self.kernel_page_size
             return torch.zeros(
-                num_pages,
-                self.page_size,
+                npu_num_pages,
+                self.kernel_page_size,
                 1,
                 kv_dim,
                 dtype=torch.bfloat16,
@@ -193,6 +213,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        kernel_page_size: int | None = None,
     ):
         super().__init__(
             size,
@@ -205,6 +226,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            kernel_page_size=kernel_page_size,
         )
 
         self.data_ptrs = torch.tensor(
@@ -514,6 +536,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_layer_num,
             device,
             enable_memory_saver,
+            kernel_page_size=page_size,
         )
 
         self.c128_kv_pool = DeepSeekV4SingleKVPool(
@@ -525,6 +548,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c128_layer_num,
             device,
             enable_memory_saver,
+            kernel_page_size=page_size,
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
@@ -543,58 +567,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_paged_compress_states(enable_memory_saver)
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
-
-        # Per-req c4/c128 slab allocator: each req_pool_idx i gets a fixed
-        # slab of `max_pages_c{N}_per_req` pages starting at i * max_per_req,
-        # keyed by compressed-seq position (not raw-kv position) so that the
-        # request's c{N} pages stay contiguous regardless of how the raw-kv
-        # allocator scattered them. Stored INSIDE the V4 token-to-kv pool
-        # rather than the request pool to avoid scheduler-side surgery.
-        # Per-page granularity uses the global page_size (matches the
-        # _forward_compressed cmp_kv reshape view).
-        c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
-        c128_n_pages_kernel = c128_size // page_size
-        # Cap per-req max pages so all max_num_reqs reqs fit; round down.
-        # NOTE: this is an *average* slab size. A single request whose
-        # compressed token count exceeds max_pages_c{N}_per_req * page_size
-        # will overflow its slab and corrupt or OOB-read neighbour slabs.
-        # This is safe in the current sizing (c4_size / c128_size are
-        # provisioned so that even at max concurrency a max-context req
-        # fits), but low-concurrency long-context workloads (e.g.
-        # max_num_reqs=1 with context_length close to swa_size) need a
-        # real per-req allocator. Logged below + asserted at write time
-        # so the failure mode is loud rather than silent corruption.
-        self.max_pages_c4_per_req = max(1, c4_n_pages_kernel // max_num_reqs)
-        self.max_pages_c128_per_req = max(1, c128_n_pages_kernel // max_num_reqs)
-        logger.info(
-            "DeepSeekV4TokenToKVPool per-req compressed-slab caps: "
-            f"c4={self.max_pages_c4_per_req} pages "
-            f"(={self.max_pages_c4_per_req * page_size} c4 tokens, "
-            f"≈{self.max_pages_c4_per_req * page_size * 4} raw tokens), "
-            f"c128={self.max_pages_c128_per_req} pages "
-            f"(={self.max_pages_c128_per_req * page_size} c128 tokens, "
-            f"≈{self.max_pages_c128_per_req * page_size * 128} raw tokens). "
-            "A single request exceeding these limits will overflow its slab."
-        )
-        # req_to_token_c{N}_pages[req_idx, k] = kernel-view page index in
-        # c{N}_kv_pool for the k-th compressed-token-page of request `req_idx`.
-        self.req_to_token_c4_pages = (
-            torch.arange(max_num_reqs * self.max_pages_c4_per_req, dtype=torch.int32)
-            .view(max_num_reqs, self.max_pages_c4_per_req)
-            .to(device)
-        )
-        self.req_to_token_c128_pages = (
-            torch.arange(max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32)
-            .view(max_num_reqs, self.max_pages_c128_per_req)
-            .to(device)
-        )
-
-    def get_req_to_token_c_pages(self, compress_ratio: int) -> torch.Tensor:
-        if compress_ratio == 4:
-            return self.req_to_token_c4_pages
-        if compress_ratio == 128:
-            return self.req_to_token_c128_pages
-        raise ValueError(f"unsupported compress_ratio={compress_ratio}")
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -686,6 +658,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
                     online=(ratio == 128 and ONLINE_C128),
+                    page_size=self.swa_page_size,
                 )
 
             if ratio == 4:
@@ -698,6 +671,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     dtype=self.state_dtype,
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
+                    page_size=self.swa_page_size,
                 )
 
             self.compress_state_pools.append(compress_state_pool)
@@ -754,6 +728,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             indexer_compress_state_pool is not None
         ), "Only c4 layers have indexer states."
         return indexer_compress_state_pool
+
+    def get_attention_compress_state_cache(self, layer_id: int) -> torch.Tensor:
+        """fp32 ``[block_num, page_size, 2*coff*D]`` view of this layer's
+        kv+score buffer. Caller is the fused compressor op
+        (``torch.ops.custom.compressor``)'s ``state_cache`` argument.
+        """
+        return self.get_attention_compress_states(layer_id).state_cache_3d
+
+    def get_indexer_compress_state_cache(self, layer_id: int) -> torch.Tensor:
+        """Same as :meth:`get_attention_compress_state_cache` for indexer
+        (c4 layers only)."""
+        return self.get_indexer_compress_states(layer_id).state_cache_3d
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.get_key_buffer(layer_id)

@@ -501,7 +501,7 @@ class C4Indexer(nn.Module):
         self.n_local_heads = self.n_heads
         # V4 c4 indexer hardcodes top-512 elsewhere; mirror that on the module
         # so forward_npu has access without piping a server arg through.
-        self.index_topk = getattr(config, "index_topk", 512)
+        self.index_topk = config.index_topk
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -674,8 +674,10 @@ class C4Indexer(nn.Module):
             # with T=0 / kv_len=0 deadlocks async on an internal collective.
             # Return the sentinel topk so downstream _forward_compressed
             # sees a well-shaped tensor without entering the indexer kernel.
-            kv_lens = forward_batch.seq_lens
-            if bs == 0 or (kv_lens.numel() > 0 and int(kv_lens.sum().item()) == 0):
+            # Use forward_mode.is_idle() instead of kv_lens.sum().item() to
+            # stay graph-capture-safe (.item() forces a host sync that ACL
+            # graph capture rejects with error 107027).
+            if bs == 0 or forward_batch.forward_mode.is_idle():
                 return torch.full(
                     (bs, self.index_topk),
                     -1,

@@ -33,11 +33,14 @@ from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
+    attn_tp_all_reduce,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -71,6 +74,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     log_info_on_rank0,
     make_layers,
 )
@@ -85,6 +89,69 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+
+# Cache for the contiguous real/imag halves of each freqs_cis tensor used in
+# _v4_rope_inplace_npu. complex freqs_cis.real / freqs_cis.imag are strided
+# views (stride=2 on the underlying interleaved real layout); on NPU,
+# `cos_half = freqs_cis.real[positions]` triggers an aclnnIndex over the
+# strided source and CANN materializes it via StridedSlice (1 of the
+# `aclnnIndex_StridedSliceAiCore_StridedSlice` ops dominant in V4 profiling).
+# Cache the contig versions keyed by id(freqs_cis); 43 layers each register
+# their own freqs_cis buffer, so this caches at most 43 (real, imag) pairs.
+# Memory cost: ≈ the same as the original complex freqs_cis (complex64 stores
+# real + imag in interleaved layout), so net memory is ~2× the original
+# but contiguity removes the per-call materialization on NPU.
+_NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
+
+
+def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return contiguous (real, imag) halves of ``freqs_cis``, cached by id.
+
+    Used by NPU rope paths to avoid the per-call StridedSlice materialization
+    triggered by aclnnIndex over the strided ``.real`` / ``.imag`` views of
+    the complex ``freqs_cis`` buffer. First call per freqs_cis pays the
+    contiguous() once; later calls reuse the cached tensors.
+
+    All callers within a single MQALayer (outer rope, indexer inner rope,
+    compressor epilog rope) get the same freqs_cis instance, so each layer
+    materializes at most one (real, imag) pair.
+    """
+    cache_key = id(freqs_cis)
+    cached = _NPU_ROPE_CONTIG_CACHE.get(cache_key)
+    if cached is None:
+        cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
+        _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
+    return cached
+
+
+def get_fused_compressor_rope_cos_sin(
+    freqs_cis: torch.Tensor,
+    positions_cmp: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
+    compressor op (``torch.ops.custom.compressor``).
+
+    The op consumes ``rope_cos`` / ``rope_sin`` of shape
+    ``[min(T, T//cmp_ratio + B), rope_head_dim]`` in bf16/fp16. We index
+    the cached contig real/imag halves of the complex ``freqs_cis`` and
+    interleave-double the last dim to match the kernel's expected layout
+    (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
+    is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
+
+    Safe to call from inside a captured aclgraph: both ``index_select`` and
+    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
+    capture-time shape produce static-shape outputs. Identical to what the
+    existing inplace_partial_rotary_mul fallback does at
+    :func:`_v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    """
+    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = real_contig.index_select(0, positions_cmp)
+    sin_half = imag_contig.index_select(0, positions_cmp)
+    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
+    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
+    return cos, sin
 
 
 def _v4_rope_inplace_npu(
@@ -120,9 +187,11 @@ def _v4_rope_inplace_npu(
     ):
         # Build cos/sin caches in the layout the kernel expects:
         # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
-        # the interleaved pairing convention.
-        cos_half = freqs_cis.real[positions]  # (T, rope_dim/2)
-        sin_half = freqs_cis.imag[positions]
+        # the interleaved pairing convention. Use contig real/imag views
+        # cached by id(freqs_cis); see _get_contig_freqs_real_imag.
+        freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+        cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
+        sin_half = freqs_imag_contig[positions]
         if inverse:
             sin_half = -sin_half
         cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
@@ -243,6 +312,44 @@ def rms_normalize_triton(
         HAS_WEIGHT=(weight is not None),
     )
     return x
+
+
+def hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    # Pure-torch sinkhorn used by the NPU native hc_pre path. Mirrors the
+    # tilelang `hc_split_sinkhorn` kernel output (same pre/post/comb shapes)
+    # so callers are drop-in compatible. NPU can't run the tilelang kernel,
+    # so this is the path that gets used in practice on Ascend.
+    pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
+    comb = comb.unflatten(-1, (hc_mult, hc_mult))
+
+    pre = (
+        F.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0))
+        + eps
+    )
+    post = 2 * F.sigmoid(
+        post * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0)
+    )
+    comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(
+        hc_mult, hc_mult
+    ).unsqueeze(0).unsqueeze(0)
+
+    comb = comb.softmax(-1) + eps
+    col_sum = comb.sum(-2, keepdim=True)
+    comb = comb / (col_sum + eps)
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = comb.sum(-1, keepdim=True)
+        comb = comb / (row_sum + eps)
+        col_sum = comb.sum(-2, keepdim=True)
+        comb = comb / (col_sum + eps)
+    return pre, post, comb
 
 
 class MQALayer(nn.Module):
@@ -419,7 +526,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size() and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -654,9 +761,6 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = forward_batch.attn_backend
@@ -740,6 +844,8 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            o = attn_tp_all_reduce(o)
 
         return o
 
@@ -804,11 +910,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         norm: Optional[nn.Module] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
 
-        @compile_in_capture_mode
+        # @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
             rsqrt = torch.rsqrt(
@@ -819,26 +926,64 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shape, dtype = x.size(), x.dtype
 
-        if x.shape[0] == 0:
-            y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
-            post = torch.empty((0, self.hc_mult), dtype=dtype, device=x.device)
-            comb = torch.empty(
-                (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
+        # NPU ascendc fused path: the cann8.5.0-a3 image ships a `custom_ops`
+        # wheel that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm
+        # + linear projection + sinkhorn iteration kernel. Opt-in via
+        # USE_FUSED_HC_PRE_ASCENDC=1; by default NPU runs the native torch
+        # path below (matches the dsv4-flash source's default).
+        if _is_npu and get_bool_env_var("USE_FUSED_HC_PRE_ASCENDC"):
+            # IDLE / empty short-circuit, mirroring the dsv4-flash source.
+            # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
+            # so the dummies must too — otherwise downstream comb/post-aware
+            # ops see a silent fp32 ↔ bf16 split between idle and non-idle
+            # batches.
+            is_idle = (
+                forward_batch is not None
+                and forward_batch.forward_mode.is_idle()
             )
-            return y, post, comb, False
+            if is_idle or x.shape[0] == 0:
+                bs = x.shape[0]
+                y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
+                post = torch.empty(
+                    (bs, self.hc_mult), dtype=torch.float32, device=x.device
+                )
+                comb = torch.empty(
+                    (bs, self.hc_mult, self.hc_mult),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                return y, post, comb, False
 
-        # NPU fast path: the cann8.5.0-a3 image ships a `custom_ops` wheel
-        # that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm +
-        # linear projection + sinkhorn iteration kernel that returns the
-        # same (post, comb, y) triple the rest of this method computes via
-        # tilelang/deep_gemm/torch. Use it instead of mhc.py on Ascend (where
-        # tilelang isn't available and the torch fallback would be slow).
-        if _is_npu:
             # Note the return order: (y, post, comb) — y is the (T, hidden)
             # mixed activation, post / comb are the hc_post inputs. The
             # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
             # cast back to the input dtype before the downstream
             # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+            _hc_pre_inputs = {
+                "x": x,
+                "hc_fn": hc_fn,
+                "hc_scale": hc_scale,
+                "hc_base": hc_base,
+                "hc_mult": self.hc_mult,
+                "hc_sinkhorn_iters": self.hc_sinkhorn_iters,
+                "norm_eps": self.rms_norm_eps,
+                "hc_eps": self.hc_eps,
+            }
+            # import os as _os, time as _time, uuid as _uuid
+            # try:
+            #     from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
+            #     _dp_rank = _get_dp_rank()
+            # except Exception:
+            #     _dp_rank = 0
+            # _dump_dir = _os.path.join(
+            #     "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
+            # )
+            # _os.makedirs(_dump_dir, exist_ok=True)
+            # _dump_path = _os.path.join(
+            #     _dump_dir,
+            #     f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
+            # )
+            # torch.save(_hc_pre_inputs, _dump_path)
             y, post, comb = torch.ops.custom.npu_hc_pre(
                 x,
                 hc_fn,
@@ -853,6 +998,31 @@ class DeepseekV4DecoderLayer(nn.Module):
             # not fold input_layernorm. Return norm_fused=False so the caller
             # applies the layernorm itself, matching the deepgemm/torch paths.
             return y.to(dtype), post, comb, False
+
+        if x.shape[0] == 0:
+            y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
+            post = torch.empty((0, self.hc_mult), dtype=dtype, device=x.device)
+            comb = torch.empty(
+                (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
+            )
+            return y, post, comb, False
+
+        # NPU native torch path. tilelang `hc_split_sinkhorn` and `deep_gemm`
+        # below are CUDA-only, so on Ascend we go straight to the pure-torch
+        # rmsnorm + linear + sinkhorn — same algorithm the source's
+        # `use_fused_hc_pre_ascendc=False` branch runs.
+        if _is_npu:
+            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            pre, post, comb = hc_split_sinkhorn_torch(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
+            return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -958,6 +1128,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
             norm=self.input_layernorm,
+            forward_batch=forward_batch,
         )
         if not norm_fused:
             hidden_states = self.input_layernorm(hidden_states)
@@ -976,6 +1147,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             norm=self.post_attention_layernorm,
+            forward_batch=forward_batch,
         )
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1002,16 +1174,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            # `get_global_dp_buffer` upstream now requires the TP group as an
-            # explicit positional arg; mirror communicator.py:986 to fix the
-            # nodeepep (moe_a2a_backend=none) path which crashed with
-            # `TypeError: get_global_dp_buffer() missing 1 required positional
-            # argument: 'group'` on every DP rank's first forward.
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # hidden_states here follow TP_ATTN_FULL semantics: they are replicated
+            # within an attention-TP group. Use replicate gather to avoid summing the
+            # same activations across attention-TP ranks before entering MLP/MoE.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -1026,10 +1196,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
         if _use_tp_moe_gather:
-            # Paired scatter back to local buffer; same TP group as the gather
-            # above (see fix comment there).
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_attention_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -1135,7 +1303,9 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Token ids are replicated within an attention-TP group. Use replicate
+            # gather here to avoid summing duplicated ids when attention_tp_size > 1.
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
