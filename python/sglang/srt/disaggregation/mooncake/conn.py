@@ -586,10 +586,16 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
+        force_flat: bool = False,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
+
+        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
+        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
+        index) whose per-layer list must not be half-split into K/V.
         """
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -599,9 +605,9 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        if self.is_mla_backend or force_flat:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
             layers_params = [
                 (
@@ -918,6 +924,20 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
+        """State types sent via the page-indexed ``_send_kvcache_generic`` path
+        (not the mamba-state path); subclasses extend for hardware components."""
+        return st in (
+            StateType.SWA,
+            StateType.DSA,
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+        )
+
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        """State types whose page lists are positional and must not be truncated."""
+        return st in (StateType.SWA_RING, StateType.C128_STATE)
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -996,7 +1016,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif self._is_generic_kvcache_state_type(st):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1008,13 +1028,20 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices_local) == 0
+                ):
+                    continue
                 if len(src_indices) != len(dst_indices_local):
-                    # SWA_RING is positional: truncating silently misaligns rows
-                    # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
-                    # 1-page drift -> keep the lenient truncation below.
-                    if st == StateType.SWA_RING:
+                    # These components are position- or request-indexed:
+                    # truncating silently misaligns rows and corrupts KV.
+                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
+                    # lenient truncation below.
+                    if self._requires_exact_state_index_match(st):
                         raise RuntimeError(
-                            "SWA_RING state index length mismatch: "
+                            f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                         )
                     logger.warning(
@@ -1033,6 +1060,42 @@ class MooncakeKVManager(CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
+                    )
+                    or rc
+                )
+            elif st == StateType.MINIMAX_INDEX_K:
+                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
+                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+                if self.pp_size is not None and self.pp_size > 1:
+                    raise RuntimeError(
+                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                    )
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        "PD disagg: heterogeneous TP not supported for MiniMax "
+                        "sparse index yet."
+                    )
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if len(src_indices) > len(dst_indices_local):
+                    src_indices = src_indices[: len(dst_indices_local)]
+                elif len(src_indices) < len(dst_indices_local):
+                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        force_flat=True,
                     )
                     or rc
                 )
@@ -1787,7 +1850,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+            # Some pools have no full-token contiguous KV (kv_item_lens empty)
+            # and ship per-pool instead, so report 0.
+            kv_item_len = (
+                self.kv_mgr.kv_args.kv_item_lens[0]
+                if self.kv_mgr.kv_args.kv_item_lens
+                else 0
+            )
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
