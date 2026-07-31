@@ -6,9 +6,9 @@ the parent's full + SWA pools.
 
 Per ``alloc_extend`` / ``alloc_decode``:
   1. super() allocates the full + SWA slots (``out_full_loc``).
-  2. Allocate c4/c128 KV slots — one compressed token per ``ratio`` raw tokens
-     (``seq_len // ratio - prefix_len // ratio``) — via the standard
-     :class:`NPUPagedTokenToKVPoolAllocator` over the pool's c4/c128 KV buffers.
+  2. Derive c4 KV slots from full and allocate c128 KV slots — one compressed
+     token per ``ratio`` raw tokens
+     (``seq_len // ratio - prefix_len // ratio``).
   3. Allocate the c4/c128 compress-state slots the same way, tail-only per req,
      using the per-req lens the scheduler packed into ``DSV4StateLens``.
   4. Return a :class:`DSV4OutCacheLoc` bundling all five slot families.
@@ -18,7 +18,7 @@ base class' ``translate_kv_loc_to_compress_state_loc`` ring-hash is the CUDA-onl
 path and is unused on NPU. The bundle is the explicit return value:
 mem_cache/common.py unpacks ``out_full_loc`` and stashes the bundle on
 ``batch.out_cache_loc_dsv4``; ``DSV4NPUReqToTokenPool`` writes the per-req
-``req_to_token_c{4,128}[_state]`` tables that :meth:`free` and the last_loc
+``req_to_token_c128`` and state tables that :meth:`free` and the last_loc
 lookups read back.
 """
 
@@ -120,7 +120,7 @@ def alloc_paged_token_slots_reserve_extend(
 
 
 class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
-    """SWA allocator + c4/c128 KV and compress-state paged allocators for DSV4 on NPU."""
+    """SWA allocator + c128/state allocators and full-derived C4 locations."""
 
     def __init__(
         self,
@@ -154,7 +154,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 need_sort=need_sort,
             )
 
-        self.c4_attn_allocator = mk(kvcache.c4_size, kvcache.c4_kv_pool)
         self.c128_attn_allocator = mk(kvcache.c128_size, kvcache.c128_kv_pool)
 
         # State allocators (paged, NPU-only). Any layer's pool works as KVCache
@@ -205,6 +204,12 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return 0
         diff = ((seq_lens_cpu // ratio) - (prefix_lens_cpu // ratio)).clamp(min=0)
         return int(diff.sum().item())
+
+    @staticmethod
+    def _derive_c4_loc_from_full(out_full_loc: torch.Tensor) -> torch.Tensor:
+        """Map full slots closing a 4-token group to their C4 slots."""
+        completed_group = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
+        return out_full_loc[completed_group] // 4
 
     @staticmethod
     def _pool_exhausted(
@@ -286,7 +291,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Allocate compressed-KV slots for an extend at ``ratio``.
 
         Prefix/seq lens are translated to compressed units (``// ratio``); the
-        c-pool last_loc comes from ``req_to_token_c{ratio}`` via
+        c-pool last_loc comes from ``req_to_token_c128`` via
         :func:`get_last_loc` so the paged allocator continues in-page (or opens
         a fresh page at a ratio boundary), keeping the intra-page continuity the
         ``cmp_block_table`` reader relies on. Returns ``_empty_loc`` when this
@@ -300,11 +305,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "alloc_extend/alloc_decode must be called with req_to_token_pool= "
             "for the c-pool last_loc lookup."
         )
-        c_table = (
-            self._cur_req_to_token_pool.req_to_token_c4
-            if ratio == 4
-            else self._cur_req_to_token_pool.req_to_token_c128
-        )
+        c_table = self._cur_req_to_token_pool.req_to_token_c128
         c_prefix = (prefix_lens // ratio).to(prefix_lens.dtype)
         c_seq = (seq_lens // ratio).to(seq_lens.dtype)
         c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
@@ -376,16 +377,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             out_c4_state_loc = self._empty_loc
             out_c128_state_loc = self._empty_loc
-        out_c4_loc = self._alloc_c_extend(
-            self.c4_attn_allocator,
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            req_pool_indices,
-            last_loc_dtype,
-            ratio=4,
-        )
+        out_c4_loc = self._derive_c4_loc_from_full(out_full_loc)
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
             prefix_lens,
@@ -719,11 +711,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
           * ``free(free_index)`` — full + SWA only (tail/radix eviction; no req
             identity, so c-pool free can't run).
           * ``free(req=, req_to_token_pool=)`` — from DSV4NPUReqToTokenPool.free
-            on req finish: reads the per-req slot lists from
-            ``req_to_token_c{4,128}[_state]`` and returns them to the c-pools
-            (the paged allocator dedupes by page).
+            on req finish: returns c128 KV and c4/c128 state pages.
 
-        KV pools free ``[0, kv_len // ratio)``. State pools are 1-per-raw-token
+        C128 KV frees ``[0, kv_len // 128)``. State pools are 1-per-raw-token
         and free only the tail ``[c{N}_state_alloc_offset, kv_len)`` — the prefix
         was already returned by ScheduleBatch._evict_swa (state rides SWA
         eviction); freeing it again would double-free (caught by the paged
@@ -741,7 +731,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         # KV pools: free the leading [0, kv_len // ratio) compressed slots.
         for ratio, allocator, table_attr in (
-            (4, self.c4_attn_allocator, "req_to_token_c4"),
             (128, self.c128_attn_allocator, "req_to_token_c128"),
         ):
             n = kv_len // ratio
@@ -781,7 +770,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # super().__init__ calls clear() before our sub-allocators exist;
         # getattr(..., None) tolerates that and the always-None state allocators.
         for attr in (
-            "c4_attn_allocator",
             "c128_attn_allocator",
             "c4_state_attn_allocator",
             "c128_state_attn_allocator",

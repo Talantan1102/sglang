@@ -39,13 +39,10 @@ def maybe_write_dsv4_extend(
 ) -> None:
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
-    For each compressed pool (c4 / c128), spreads the flat
-    ``out_c{4,128}_loc`` tensor across requests using per-req extend
-    counts (``seq_lens[i] // ratio - prefix_lens[i] // ratio``) and writes
-    the resulting slot ids into ``req_to_token_c{4,128}[req, prefix:seq]``.
+    Spreads the flat ``out_c128_loc`` tensor across requests and writes the
+    resulting slot ids into ``req_to_token_c128[req, prefix:seq]``. C4
+    locations are derived from the full-token table.
 
-    Also writes ``req_to_token_swa[req, prefix:seq]`` with the swa slots
-    derived from out_full_loc via the SWA index mapping.
     """
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
@@ -54,7 +51,7 @@ def maybe_write_dsv4_extend(
         return
 
     req_to_token_pool = batch.req_to_token_pool
-    if not hasattr(req_to_token_pool, "write_c4"):
+    if not hasattr(req_to_token_pool, "write_c128"):
         return  # non-DSV4 pool; skip defensively (shouldn't happen)
 
     # c4_state / c128_state writes: tail-only. Bundle length is
@@ -91,6 +88,7 @@ def dsv4_state_payloads(
     page_size: int,
     window_size: int,
     *,
+    translate_loc_from_full_to_swa,
     prefix_len: int = 0,
 ):
     """Per-StateType PD-payload builders for DSV4-on-NPU.
@@ -99,7 +97,7 @@ def dsv4_state_payloads(
     the req table. PD only needs the final active tail state; scanning the whole
     prompt span would transfer stale state pages and can perturb decode accuracy.
     """
-    if not hasattr(req_to_token_pool, "req_to_token_c4"):
+    if not hasattr(req_to_token_pool, "req_to_token_c128"):
         return {}
 
     import numpy as np
@@ -112,7 +110,14 @@ def dsv4_state_payloads(
     def empty_pages():
         return np.empty((0,), dtype=np.int32)
 
-    def pages(table, lo: int, hi: int, *, drop_zero_pages: bool = False):
+    def pages(
+        table,
+        lo: int,
+        hi: int,
+        *,
+        translate_loc=None,
+        drop_zero_pages: bool = False,
+    ):
         if hi <= lo:
             return empty_pages()
 
@@ -123,7 +128,10 @@ def dsv4_state_payloads(
         if page_hi <= page_lo:
             return empty_pages()
 
-        slots = table[req_pool_idx, page_lo:page_hi:page_size].cpu().numpy()
+        slots = table[req_pool_idx, page_lo:page_hi:page_size]
+        if translate_loc is not None:
+            slots = translate_loc(slots)
+        slots = slots.cpu().numpy()
         if slots.size == 0:
             return empty_pages()
 
@@ -165,19 +173,20 @@ def dsv4_state_payloads(
     # DSV4_INDEXER shares the c4 slot space (written at the c4 loc).
     return {
         AscendStateType.DSV4_SWA: lambda: pages(
-            req_to_token_pool.req_to_token_swa,
+            req_to_token_pool.req_to_token,
             window_start,
             seq_len,
+            translate_loc=translate_loc_from_full_to_swa,
             drop_zero_pages=True,
         ),
         AscendStateType.DSV4_C4: lambda: pages(
-            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+            req_to_token_pool.req_to_token, prefix_len, seq_len
         ),
         AscendStateType.DSV4_C128: lambda: pages(
             req_to_token_pool.req_to_token_c128, prefix_len // 128, seq_len // 128
         ),
         AscendStateType.DSV4_INDEXER: lambda: pages(
-            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+            req_to_token_pool.req_to_token, prefix_len, seq_len
         ),
         AscendStateType.DSV4_C4_STATE: lambda: state_pages(
             req_to_token_pool.req_to_token_c4_state, 4
@@ -191,7 +200,7 @@ def dsv4_state_payloads(
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
     """Extra ``alloc_extend(_swa_tail)`` kwargs for the DSV4 allocator; ``{}`` for
     non-DSV4 so callers can splat it unconditionally."""
-    if not hasattr(allocator, "c4_attn_allocator"):
+    if not hasattr(allocator, "c128_attn_allocator"):
         return {}
     return dict(
         req_pool_indices=torch.tensor(
@@ -205,7 +214,7 @@ def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device)
 
 
 def dsv4_unwrap_prealloc(kv_loc, req_to_token_pool, req, prefix_len, fill_len):
-    """Unwrap a DSV4OutCacheLoc bundle to its full-pool loc and write the five
+    """Unwrap a DSV4OutCacheLoc bundle to its full-pool loc and write the
     per-req tables; a plain tensor (non-DSV4) passes through unchanged."""
     if kv_loc is None or not hasattr(kv_loc, "out_full_loc"):
         return kv_loc
@@ -220,9 +229,9 @@ def write_dsv4_prealloc_tables(
     fill_len: int,
     bundle,
 ) -> None:
-    """Write the five DSV4 per-req tables for one request on the disagg-decode
+    """Write the DSV4 per-req tables for one request on the disagg-decode
     prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
-    if bundle is None or not hasattr(req_to_token_pool, "write_c4"):
+    if bundle is None or not hasattr(req_to_token_pool, "write_c128"):
         return
     rp = torch.tensor([req.req_pool_idx])
     pl = torch.tensor([prefix_len])
@@ -249,23 +258,7 @@ def _write_dsv4_tables(
     c4_state_offsets: Sequence[int] | torch.Tensor,
     c128_state_offsets: Sequence[int] | torch.Tensor,
 ) -> None:
-    """Write DSV4 SWA, compressed-KV, and compression-state tables."""
-    _write_per_req_slice(
-        req_to_token_pool.write_swa,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_swa_loc,
-        ratio=1,
-    )
-    _write_per_req_slice(
-        req_to_token_pool.write_c4,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_c4_loc,
-        ratio=4,
-    )
+    """Write DSV4 compressed-KV and compression-state tables."""
     _write_per_req_slice(
         req_to_token_pool.write_c128,
         req_pool_indices_cpu,
@@ -302,9 +295,8 @@ def maybe_write_dsv4_decode(
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
-    """Post-alloc_decode hook for DSV4. Spreads the new token slot ids
-    (one per req for swa, gated by ratio boundary for c4/c128) into the
-    per-req tables on DSV4NPUReqToTokenPool.
+    """Post-alloc_decode hook for DSV4. Spreads new c128/state slot ids into
+    the per-req tables on DSV4NPUReqToTokenPool.
 
     ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
     ``token_per_req``); the new compressed tokens go at positions
@@ -317,28 +309,12 @@ def maybe_write_dsv4_decode(
         return
 
     req_to_token_pool = batch.req_to_token_pool
-    if not hasattr(req_to_token_pool, "write_c4"):
+    if not hasattr(req_to_token_pool, "write_c128"):
         return
 
     prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
     req_pool_indices_cpu = batch.req_pool_indices.cpu()
 
-    _write_per_req_slice(
-        req_to_token_pool.write_swa,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_swa_loc,
-        ratio=1,
-    )
-    _write_per_req_slice(
-        req_to_token_pool.write_c4,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_c4_loc,
-        ratio=4,
-    )
     _write_per_req_slice(
         req_to_token_pool.write_c128,
         req_pool_indices_cpu,
@@ -381,7 +357,7 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     the larger allocation bundle produced during decode preparation.
     """
     pool = batch.req_to_token_pool
-    if not hasattr(pool, "req_to_token_c4"):
+    if not hasattr(pool, "req_to_token_c128"):
         return None
     reserve_bundle = batch.out_cache_loc_dsv4
     if reserve_bundle is None:
@@ -399,10 +375,14 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
                 chunks.append(table[int(req_idx), start:end])
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
+    out_full_loc = batch.out_cache_loc
+    out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
     return type(reserve_bundle)(
-        out_full_loc=batch.out_cache_loc,
-        out_swa_loc=flatten_interval(pool.req_to_token_swa, 1),
-        out_c4_loc=flatten_interval(pool.req_to_token_c4, 4),
+        out_full_loc=out_full_loc,
+        out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            out_full_loc
+        ),
+        out_c4_loc=out_c4_loc,
         out_c128_loc=flatten_interval(pool.req_to_token_c128, 128),
         out_c4_state_loc=flatten_interval(pool.req_to_token_c4_state, 1),
         out_c128_state_loc=flatten_interval(pool.req_to_token_c128_state, 1),

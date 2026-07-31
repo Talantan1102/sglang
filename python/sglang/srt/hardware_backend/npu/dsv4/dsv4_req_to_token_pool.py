@@ -1,19 +1,15 @@
 """DSV4-NPU per-request mapping pool.
 
-Subclass of ``ReqToTokenPool`` that adds five auxiliary per-request tables
+Subclass of ``ReqToTokenPool`` that adds three auxiliary per-request tables
 needed by the DSV4 attention backend:
 
-  * ``req_to_token_swa``        — slot ids in the SWA full-pool view
-  * ``req_to_token_c4``         — slot ids in the c4 compressed-KV pool
   * ``req_to_token_c128``       — slot ids in the c128 compressed-KV pool
   * ``req_to_token_c4_state``   — c4 state-pool slot ids, 1 per raw token
   * ``req_to_token_c128_state`` — c128 state-pool slot ids, 1 per raw token
 
-Compressed KV pools store 1 slot per ``ratio`` raw tokens, so their per-req
-table column count is ``max_context_len // ratio``. swa mirrors the raw
-token count. Elements are token-level slot ids; the attention backend
-converts to page ids via ``// page_size`` when constructing PA_ND block
-tables.
+The c128 KV pool stores 1 slot per 128 raw tokens, so its per-req table column
+count is ``max_context_len // 128``. C4 locations are derived from the base
+full-token table, and SWA locations use the existing full-to-SWA mapping.
 
 The c4/c128 STATE pools also have per-req tables here: the NPU fused
 compressor uses a paged state pool (``cache_mode=1``), so each raw token's
@@ -22,8 +18,7 @@ state slot id is recorded (1 column per raw token) and the backend builds
 to feed the kernel. (The base class' ``translate_kv_loc_to_compress_state_loc``
 ring-hash is the CUDA-only path; it is disabled on NPU.)
 
-Memory cost example (size=64, max_context_len=32K): swa 8MB + c4 2MB +
-c128 64KB ≈ 10MB extra on top of the base req_to_token (8MB).
+The c128 address table costs 64KB for size=64 and max_context_len=32K.
 
 The tables are populated by the ``dsv4_common_hooks`` writers (driven from
 ``mem_cache/common.py``) immediately after a successful alloc_extend /
@@ -59,16 +54,14 @@ class DSV4ReqToTokenTablesMixin:
 
         # Back-ref to DSV4NPUTokenToKVPoolAllocator, wired via
         # register_dsv4_allocator after both exist, so free(req) can release
-        # c4/c128 pages. None at construction so base clear() runs safely.
+        # c128 pages. None at construction so base clear() runs safely.
         self._dsv4_allocator = None
 
-        # (name, columns). swa + state tables: 1 slot per raw token; c4/c128:
-        # 1 slot per `ratio` raw tokens. Init zero so unallocated columns map to
+        # (name, columns). State tables: 1 slot per raw token; c128: 1 slot per
+        # 128 raw tokens. Init zero so unallocated columns map to
         # block 0 (kernel skip sentinel cleared by NPUCompressStatePool).
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             for name, cols in (
-                ("req_to_token_swa", max_context_len),
-                ("req_to_token_c4", max(1, max_context_len // 4)),
                 ("req_to_token_c128", max(1, max_context_len // 128)),
                 ("req_to_token_c4_state", max_context_len),
                 ("req_to_token_c128_state", max_context_len),
@@ -85,12 +78,6 @@ class DSV4ReqToTokenTablesMixin:
 
     # Per-pool write helpers, called by mem_cache/common.py after alloc, using
     # slot indices from DSV4OutCacheLoc. Args: (req_pool_idx, token_offset), slot.
-    def write_swa(self, indices, values: torch.Tensor) -> None:
-        self.req_to_token_swa[indices] = values
-
-    def write_c4(self, indices, values: torch.Tensor) -> None:
-        self.req_to_token_c4[indices] = values
-
     def write_c128(self, indices, values: torch.Tensor) -> None:
         self.req_to_token_c128[indices] = values
 
@@ -102,18 +89,18 @@ class DSV4ReqToTokenTablesMixin:
 
     def register_dsv4_allocator(self, allocator) -> None:
         """Wire the DSV4NPUTokenToKVPoolAllocator ref so ``free(req)`` can
-        release c4/c128 pool pages alongside the req_pool_idx slot."""
+        release c128/state pool pages alongside the req_pool_idx slot."""
         self._dsv4_allocator = allocator
 
     def _dsv4_free(self, req) -> None:
-        # Trigger c4/c128 free via the allocator's unified free path. May be None
+        # Trigger c128/state free via the allocator's unified free path. May be None
         # between __init__ and register_dsv4_allocator — defensive None check.
         if self._dsv4_allocator is not None:
             self._dsv4_allocator.free(req=req, req_to_token_pool=self)
 
 
 class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
-    """ReqToTokenPool extended with DSV4 SWA + c4/c128 per-req tables.
+    """ReqToTokenPool extended with DSV4 c128 and state per-req tables.
 
     Drop-in replacement for ReqToTokenPool when the model is DeepSeek-V4 on
     NPU. Selected by ``model_runner_kv_cache_mixin`` based on model arch +
@@ -141,7 +128,7 @@ class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
 
 
 class DSV4NPUDecodeReqToTokenPool(DSV4ReqToTokenTablesMixin, DecodeReqToTokenPool):
-    """DecodeReqToTokenPool with the DSV4 swa/c4/c128(+state) per-req tables.
+    """DecodeReqToTokenPool with the DSV4 c128(+state) per-req tables.
 
     The disagg-decode counterpart of DSV4NPUReqToTokenPool; DecodeReqToTokenPool
     pre-allocates extra req slots for in-flight prefill transfers.

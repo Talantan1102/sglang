@@ -1080,7 +1080,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     break
 
             if total_prefix_len != 0 and hasattr(
-                self.token_to_kv_pool_allocator, "c4_attn_allocator"
+                self.token_to_kv_pool_allocator, "c128_attn_allocator"
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -1204,7 +1204,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
-            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+            if hasattr(self.req_to_token_pool, "req_to_token_c128"):
                 # DSV4 on NPU: per-pool dst page indices, produced by the same
                 # shared builder prefill uses so src/dst line up positionally.
                 if total_prefix_len != 0:
@@ -1226,6 +1226,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.token_to_kv_pool_allocator.page_size,
                         self.scheduler.sliding_window_size,
                         prefix_len=total_prefix_len,
+                        translate_loc_from_full_to_swa=(
+                            self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa
+                        ),
                     )
                 )
             state_indices: Optional[List] = [
@@ -1674,7 +1677,7 @@ def alloc_for_decode_prealloc(
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
-        if hasattr(allocator, "c4_attn_allocator"):
+        if hasattr(allocator, "c128_attn_allocator"):
             assert req_to_token_pool is not None
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                 dsv4_prealloc_kwargs,

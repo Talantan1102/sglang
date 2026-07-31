@@ -49,10 +49,10 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
     ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
-    K_nope + K_rope as bf16, and requires ``cmp_kv.shape[1] == ori_kv.shape[1]``.
-    So the c4/c128 pools (whose token-level page_size is ``page_size // ratio``)
-    are allocated at the GLOBAL ``kernel_page_size`` rather than their own
-    per-ratio page_size; the SWA pool uses ``kernel_page_size == page_size``.
+    K_nope + K_rope as bf16. C4 uses its native 32-token page so its physical
+    page id can be shared with the corresponding 128-token full page. C128
+    cannot use its native page size 1 in the NPU kernel and therefore keeps the
+    global kernel page size. SWA uses ``kernel_page_size == page_size``.
     The CUDA fp8-packed-bytes layout (the base ``create_buffer``) is untouched.
     """
 
@@ -68,8 +68,8 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             return super().create_buffer(num_pages=num_pages)
         kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.kv_cache_total_dim = kv_dim
-        # GLOBAL kernel_page_size keeps cmp_kv.shape[1] == ori_kv.shape[1]; writes
-        # are flat-indexed by loc, so page granularity affects shape not location.
+        # Writes are flat-indexed by loc; kernel_page_size controls the physical
+        # page layout exposed to the NPU operators.
         npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
         return torch.zeros(
             npu_num_pages,
@@ -195,7 +195,7 @@ class NPUCompressStatePool(CompressStatePool):
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     """NPU c4-indexer pool. Keeps the base packed CUDA buffer (read by
     get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
-    buffers in PA_ND layout at the global ``kernel_page_size``, written by
+    buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
     ``torch.ops.custom.npu_quant_lightning_indexer``.
     """
@@ -301,6 +301,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "enable_hisparse is not supported on the NPU DSV4 KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
+        # C4 uses its native page size; other pools keep the global page size.
+        is_c4_pool = page_size * 4 == global_page_size
+        kernel_page_size = page_size if is_c4_pool else global_page_size
         return NPUDeepSeekV4SingleKVPool(
             size,
             page_size,
@@ -310,7 +313,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num,
             device,
             enable_memory_saver,
-            kernel_page_size=global_page_size,
+            kernel_page_size=kernel_page_size,
         )
 
     def _get_state_pool(self, layer_id: int, from_indexer: bool) -> CompressStatePool:
@@ -376,8 +379,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         device: str,
         enable_memory_saver: bool,
     ) -> NPUDeepSeekV4IndexerPool:
-        # NPU dedicated int8 K + fp16 scale buffers use the GLOBAL page_size
-        # (= self.page_size) as kernel_page_size, matching ori_kv for the kernel.
+        # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
             size,
             page_size,
@@ -386,7 +388,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num,
             device,
             enable_memory_saver,
-            kernel_page_size=self.page_size,
+            kernel_page_size=page_size,
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:

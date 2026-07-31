@@ -321,7 +321,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 result[f"c{ratio}_loc"] = compress_out_loc
 
             c_table = (
-                req_to_token_pool.req_to_token_c4
+                req_to_token
                 if ratio == 4
                 else req_to_token_pool.req_to_token_c128
             )
@@ -330,7 +330,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 n_c_tokens = seq_lens_max // ratio
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
-            slots = c_table[req_pool_64, :n_c_tokens]
+            table_tokens = n_c_tokens * ratio if ratio == 4 else n_c_tokens
+            slots = c_table[req_pool_64, :table_tokens]
             c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
                 torch.int32
             )
@@ -742,20 +743,20 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             rope_slice.copy_(rope_rot.view_as(rope_slice))
             if compressor.rotate:
                 kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
-            # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
-            # token-level slot id table is indexed directly by compressed-seq
-            # position (elements already are c-pool slot ids; no page indirection).
+            # c{N}_kv_pool slot per compressed token.
             req_indices_flat = torch.cat(write_req_indices, dim=0)
             pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
             req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
-            c_table = (
-                self.req_to_token_pool.req_to_token_c4
-                if ratio == 4
-                else self.req_to_token_pool.req_to_token_c128
-            )
-            write_locs = c_table[
-                req_pool_flat.to(torch.int64), pos_in_req_flat.to(torch.int64)
-            ].to(torch.int32)
+            if ratio == 4:
+                full_pos = pos_in_req_flat * ratio + (ratio - 1)
+                write_locs = (
+                    self.req_to_token_pool.req_to_token[req_pool_flat, full_pos]
+                    // ratio
+                ).to(torch.int32)
+            else:
+                write_locs = self.req_to_token_pool.req_to_token_c128[
+                    req_pool_flat, pos_in_req_flat
+                ].to(torch.int32)
             self._compressor_epilog_npu(
                 compressor, kv_out, forward_batch, override_loc=write_locs
             )
@@ -897,7 +898,12 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         for i, _end_token in enumerate(end_pos):
             seq_i = int(seqlens_cpu[i])
             kv_indices = _get_kv_indices(
-                forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
+                forward_batch,
+                seq_i // ratio,
+                page_table,
+                i,
+                seq_i // ratio,
+                page_size=self.page_size // ratio,
             )
             kv_cache_value = self.token_to_kv_pool.get_compress_buffer(
                 c4_indexer.layer_id, True, kv_indices
@@ -1722,9 +1728,13 @@ class DeepseekV4AscendAttnBackend(
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
-        assert cmp_native_page_size == ori_page_size, (
-            f"cmp page_size={cmp_native_page_size} != ori page_size={ori_page_size}; "
-            "c{N}_kv_pool must be allocated with the global page_size on NPU "
+        expected_cmp_page_size = (
+            ori_page_size // 4 if compress_ratio == 4 else ori_page_size
+        )
+        assert cmp_native_page_size == expected_cmp_page_size, (
+            f"c{compress_ratio} page_size={cmp_native_page_size} != "
+            f"expected={expected_cmp_page_size} for ori page_size={ori_page_size}; "
+            "C4 must use its native page and C128 must keep the global page "
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
@@ -1948,10 +1958,12 @@ def _get_kv_indices(
     page_table: torch.Tensor,
     req_idx: int,
     seqlen: int,
+    page_size: Optional[int] = None,
 ) -> torch.Tensor:
     logic_start = max(0, seqlen - kv_len)
     logic_end = seqlen
-    page_size = get_attn_backend().page_size
+    if page_size is None:
+        page_size = get_attn_backend().page_size
     if page_size == 1:
         return page_table[req_idx, logic_start:logic_end]
     logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
