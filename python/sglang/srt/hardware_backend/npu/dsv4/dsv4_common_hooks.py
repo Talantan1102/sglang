@@ -1,4 +1,4 @@
-"""Helpers used by mem_cache/common.py to wire DSV4-NPU per-req tables.
+"""Helpers used by mem_cache/common.py to wire DSV4-NPU KV tables.
 
 mem_cache/common.py runs platform-agnostic alloc flow. When the model is
 DSV4 on NPU, ``alloc_paged_token_slots_{extend,decode}`` already stashed the
@@ -7,8 +7,11 @@ DSV4 on NPU, ``alloc_paged_token_slots_{extend,decode}`` already stashed the
 these hooks then:
 
   1. Read the bundle from ``batch.out_cache_loc_dsv4``.
-  2. Write the per-pool slot ids into the per-req tables on the
-     :class:`DSV4NPUReqToTokenPool`.
+  2. Write the independently allocated C128 KV slots into the per-request table.
+
+Compressor state is fixed ring storage and does not participate in this
+allocation/write path. Legacy state-table PD/Graph readers are removed by the
+later consumer subchanges.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -20,7 +23,7 @@ bypasses the batch hook; it writes the same tables via
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -33,9 +36,6 @@ def maybe_write_dsv4_extend(
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
-    *,
-    c4_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
-    c128_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
 ) -> None:
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
@@ -54,30 +54,12 @@ def maybe_write_dsv4_extend(
     if not hasattr(req_to_token_pool, "write_c128"):
         return  # non-DSV4 pool; skip defensively (shouldn't happen)
 
-    # c4_state / c128_state writes: tail-only. Bundle length is
-    # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens. Normal extend
-    # uses the per-Req low-water marks; reserve callers can pass explicit raw
-    # offsets for the pre-reserved interval.
-    if c4_state_alloc_offsets is None:
-        c4_state_alloc_offsets = [
-            getattr(r, "c4_state_write_offset", getattr(r, "c4_state_alloc_offset", 0))
-            for r in batch.reqs
-        ]
-    if c128_state_alloc_offsets is None:
-        c128_state_alloc_offsets = [
-            getattr(
-                r, "c128_state_write_offset", getattr(r, "c128_state_alloc_offset", 0)
-            )
-            for r in batch.reqs
-        ]
     _write_dsv4_tables(
         req_to_token_pool,
         req_pool_indices_cpu,
         prefix_lens_cpu,
         seq_lens_cpu,
         bundle,
-        c4_state_offsets=c4_state_alloc_offsets,
-        c128_state_offsets=c128_state_alloc_offsets,
     )
 
 
@@ -206,9 +188,6 @@ def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device)
         req_pool_indices=torch.tensor(
             [req.req_pool_idx], dtype=torch.int64, device=device
         ),
-        dsv4_state_lens=allocator.compute_dsv4_state_lens_extend(
-            [req], [fill_len], [0]
-        ),
         req_to_token_pool=req_to_token_pool,
     )
 
@@ -243,8 +222,6 @@ def write_dsv4_prealloc_tables(
         pl,
         sl,
         bundle,
-        c4_state_offsets=[getattr(req, "c4_state_alloc_offset", 0)],
-        c128_state_offsets=[getattr(req, "c128_state_alloc_offset", 0)],
     )
 
 
@@ -254,11 +231,8 @@ def _write_dsv4_tables(
     prefix_lens_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     bundle,
-    *,
-    c4_state_offsets: Sequence[int] | torch.Tensor,
-    c128_state_offsets: Sequence[int] | torch.Tensor,
 ) -> None:
-    """Write DSV4 compressed-KV and compression-state tables."""
+    """Write the remaining independently allocated C128 KV table."""
     _write_per_req_slice(
         req_to_token_pool.write_c128,
         req_pool_indices_cpu,
@@ -268,35 +242,13 @@ def _write_dsv4_tables(
         ratio=128,
     )
 
-    if bundle.out_c4_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c4_state"
-    ):
-        _write_state_tail_per_req(
-            req_to_token_pool.write_c4_state,
-            req_pool_indices_cpu,
-            c4_state_offsets,
-            seq_lens_cpu,
-            bundle.out_c4_state_loc,
-        )
-    if bundle.out_c128_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c128_state"
-    ):
-        _write_state_tail_per_req(
-            req_to_token_pool.write_c128_state,
-            req_pool_indices_cpu,
-            c128_state_offsets,
-            seq_lens_cpu,
-            bundle.out_c128_state_loc,
-        )
-
-
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
-    """Post-alloc_decode hook for DSV4. Spreads new c128/state slot ids into
-    the per-req tables on DSV4NPUReqToTokenPool.
+    """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
+    the per-req table on DSV4NPUReqToTokenPool.
 
     ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
     ``token_per_req``); the new compressed tokens go at positions
@@ -323,31 +275,6 @@ def maybe_write_dsv4_decode(
         bundle.out_c128_loc,
         ratio=128,
     )
-
-    # State table decode writes: one slot per raw decode token (ratio=1).
-    if bundle.out_c4_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c4_state"
-    ):
-        _write_per_req_slice(
-            req_to_token_pool.write_c4_state,
-            req_pool_indices_cpu,
-            prefix_lens_cpu,
-            seq_lens_cpu,
-            bundle.out_c4_state_loc,
-            ratio=1,
-        )
-    if bundle.out_c128_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c128_state"
-    ):
-        _write_per_req_slice(
-            req_to_token_pool.write_c128_state,
-            req_pool_indices_cpu,
-            prefix_lens_cpu,
-            seq_lens_cpu,
-            bundle.out_c128_state_loc,
-            ratio=1,
-        )
-
 
 def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     """Build the DSV4 cache-location view for one target-verify pass.
@@ -384,8 +311,6 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
         ),
         out_c4_loc=out_c4_loc,
         out_c128_loc=flatten_interval(pool.req_to_token_c128, 128),
-        out_c4_state_loc=flatten_interval(pool.req_to_token_c4_state, 1),
-        out_c128_state_loc=flatten_interval(pool.req_to_token_c128_state, 1),
     )
 
 
@@ -417,23 +342,6 @@ def _write_per_req(
         pt += alloc_len
 
 
-def _write_state_tail_per_req(
-    write_fn,
-    req_pool_indices_cpu: torch.Tensor,
-    state_alloc_offsets: list,
-    seq_lens_cpu: torch.Tensor,
-    flat_loc: torch.Tensor,
-) -> None:
-    """Tail-only state write: req i's slots go at ``[state_alloc_offsets[i],
-    seq_lens[i])`` in ``req_to_token_c{N}_state``."""
-    _write_per_req(
-        write_fn,
-        req_pool_indices_cpu,
-        flat_loc,
-        lambda i: (int(state_alloc_offsets[i]), int(seq_lens_cpu[i].item())),
-    )
-
-
 def _write_per_req_slice(
     write_fn,
     req_pool_indices_cpu: torch.Tensor,
@@ -453,108 +361,3 @@ def _write_per_req_slice(
             int(seq_lens_cpu[i].item()) // ratio,
         ),
     )
-
-
-def maybe_evict_dsv4_state(batch: ScheduleBatch, req: Req, pre_len: int) -> None:
-    """Per-decode evict for the DSV4-NPU compress-state pools, independent of
-    SWA evict cadence. Called every decode step from ``ScheduleBatch``.
-
-    The state pool is small (~2 pages c4 / ~3 pages c128 of raw positions per
-    req) — with a large sliding_window (SWA evict fires every
-    ``eviction_interval`` and needs ``pre_len > sliding_window + page_size`` to
-    free anything) the pool exhausts before the first SWA frontier advance, so
-    we drain it here on its own cadence.
-
-    Retention windows (kernel read window + decode lookahead margin):
-    c4 = 8 + 16, c128 = 128 + 64 raw positions — intentionally smaller than one
-    SWA page so the first eviction fires before the small pool fills. Watermarks
-    are page-aligned so freed slots are whole pages reclaimable by the paged
-    allocator. ``req.c{4,128}_state_alloc_offset`` (read/written via getattr/
-    setattr) is the low-water mark. No-op on non-DSV4-NPU paths.
-    """
-    allocator = batch.token_to_kv_pool_allocator
-    pool = batch.req_to_token_pool
-    if not hasattr(allocator, "c4_state_attn_allocator") or (
-        allocator.c4_state_attn_allocator is None
-        and allocator.c128_state_attn_allocator is None
-    ):
-        return
-
-    page_size = batch.tree_cache.page_size
-    c4_watermark = ((max(0, pre_len - (8 + 16))) // page_size) * page_size
-    c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
-
-    _free_state_range(
-        allocator.c4_state_attn_allocator,
-        pool,
-        "req_to_token_c4_state",
-        req,
-        "c4_state_alloc_offset",
-        c4_watermark,
-    )
-    _free_state_range(
-        allocator.c128_state_attn_allocator,
-        pool,
-        "req_to_token_c128_state",
-        req,
-        "c128_state_alloc_offset",
-        c128_watermark,
-    )
-
-
-def maybe_evict_dsv4_state_on_swa(
-    allocator, pool, req: Req, new_swa_evicted_seqlen: int
-) -> None:
-    """Free compress-state slots that ride along with SWA eviction.
-
-    State at raw positions < ``swa_evicted_seqlen`` is no longer readable (the
-    compressor only reads the trailing ``2*ratio`` window) and is returned to
-    its paged allocator to keep the small state pool from exhausting on long
-    generations. No-op when the DSV4-NPU state allocators are absent.
-
-    This path is needed for small-sliding-window models where
-    ``sliding_window < retention`` (e.g. c128 retention 192 > window 128):
-    in that case the watermark-based eviction alone may not free slots
-    fast enough, and the SWA-ride eviction is the primary reclaim mechanism.
-    For typical large-window models (DS-V4 with window >> 192), the
-    watermark eviction always runs first, making this path a no-op.
-    """
-    if not hasattr(allocator, "c4_state_attn_allocator"):
-        return
-    _free_state_range(
-        allocator.c4_state_attn_allocator,
-        pool,
-        "req_to_token_c4_state",
-        req,
-        "c4_state_alloc_offset",
-        new_swa_evicted_seqlen,
-    )
-    _free_state_range(
-        allocator.c128_state_attn_allocator,
-        pool,
-        "req_to_token_c128_state",
-        req,
-        "c128_state_alloc_offset",
-        new_swa_evicted_seqlen,
-    )
-
-
-def _free_state_range(
-    state_allocator,
-    pool,
-    table_attr: str,
-    req: Req,
-    offset_attr: str,
-    watermark: int,
-) -> None:
-    """Free ``[alloc_offset, watermark)`` raw-position state slots for ``req``
-    and advance its low-water mark. No-op when the allocator/table is absent or
-    the watermark hasn't advanced past the current offset."""
-    offset = getattr(req, offset_attr, 0)
-    if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
-        return
-    free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
-    free_slots = free_slots[free_slots > 0]
-    if free_slots.numel() > 0:
-        state_allocator.free(free_slots.to(torch.int64))
-    setattr(req, offset_attr, watermark)

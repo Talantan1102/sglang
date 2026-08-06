@@ -20,6 +20,6 @@
 
   <path d="M230 211 H275" class="edge"/><path d="M500 211 H545" class="edge"/><path d="M790 211 H835" class="edge"/><path d="M1060 211 H1105" class="edge"/><path d="M1355 211 H1400" class="edge"/><path d="M1630 211 H1675" class="edge"/>
 
-  <rect x="660" y="340" width="680" height="82" class="box changed"/><text x="1000" y="373" class="t">NPUCompressStatePool（保留类与接口）</text><text x="1000" y="399" class="s">当前为 FP32 paged tensor；子改动 1 原地改造成 request ring layout</text>
+  <rect x="660" y="340" width="680" height="82" class="box changed"/><text x="1000" y="373" class="t">NPUCompressStatePool（保留类与接口）</text><text x="1000" y="399" class="s">当前为 FP32 paged tensor；子改动 1 原地改造成显式 state_loc layout</text>
   <path d="M1340 381 H1812 V272" class="edge"/>
 </svg>

@@ -1,32 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="610" viewBox="0 0 2000 610" role="img" aria-labelledby="title desc">
-  <title id="title">Compressor state request-scoped ring 重构后</title>
-  <desc id="desc">展示三类 state pool 统一使用 req_pool_idx bank，通过 start_pos 与 seqused 调用 cache_mode 2 Compressor。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="650" viewBox="0 0 2000 650" role="img" aria-labelledby="title desc">
+  <title id="title">Compressor state 显式 state_loc ring 重构后</title>
+  <desc id="desc">地址计算复用GPU公共路径；NPU只在调用新版cache mode 2算子前按ratio临时组装二维state_block_table。</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#64748B"/></marker>
     <style>
       .title{font:700 25px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#0F172A}.sub{font:15px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#475569}.box{rx:10;ry:10;stroke-width:2}.reused{fill:#E8F1FB;stroke:#3B82F6}.added{fill:#E8F7EE;stroke:#22A06B}.changed{fill:#FFF4D6;stroke:#D97706}.neutral{fill:#F4F5F7;stroke:#6B7280}.result{fill:#EEE8FF;stroke:#7C3AED}.group{fill:#FFF9EB;stroke:#D97706;stroke-width:2;rx:14;ry:14}.t{font:600 16px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#0F172A;text-anchor:middle}.s{font:14px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#334155;text-anchor:middle}.edge{fill:none;stroke:#64748B;stroke-width:2;marker-end:url(#arrow)}
     </style>
   </defs>
-  <text x="40" y="45" class="title">改动二后：三类 Compressor state 统一使用 request-scoped ring</text>
-  <text x="40" y="74" class="sub">bank=req_pool_idx；offset=(start_pos + token_offset) % ring_size。无 state allocator、state loc 或 state request table。</text>
+  <text x="40" y="45" class="title">改动二后：Compressor state 使用 GPU 风格显式 state_loc</text>
+  <text x="40" y="74" class="sub">C4/C128 地址复用 GPU translate；二维 table 只是 A3 调用参数，不是长期 request table 或新 ownership。</text>
 
-  <rect x="40" y="180" width="210" height="100" class="box neutral"/><text x="145" y="219" class="t">ScheduleBatch</text><text x="145" y="246" class="s">Prefill / Decode / Verify</text>
-  <rect x="300" y="125" width="250" height="100" class="box reused"/><text x="425" y="164" class="t">req_pool_indices</text><text x="425" y="191" class="s">1..N active，0=dummy</text>
-  <rect x="300" y="260" width="250" height="115" class="box reused"/><text x="425" y="297" class="t">Sequence Metadata</text><text x="425" y="325" class="s">start_pos / seqused</text><text x="425" y="350" class="s">cu_seqlens</text>
-  <rect x="610" y="125" width="290" height="100" class="box changed"/><text x="755" y="164" class="t">compress_state_bank</text><text x="755" y="191" class="s">req_pool_indices → INT32[B]</text>
+  <rect x="40" y="220" width="210" height="100" class="box neutral"/><text x="145" y="259" class="t">ScheduleBatch</text><text x="145" y="286" class="s">Prefill / Decode / Verify</text>
 
-  <rect x="970" y="95" width="440" height="405" class="group"/><text x="1190" y="128" class="t">NPUCompressStatePool：三类 per-layer ring</text>
-  <rect x="1010" y="160" width="360" height="82" class="box changed"/><text x="1190" y="191" class="t">C4A Attention State</text><text x="1190" y="217" class="s">[req_slots, ring4, 2048] FP32</text>
-  <rect x="1010" y="270" width="360" height="82" class="box changed"/><text x="1190" y="301" class="t">C4Li Indexer State</text><text x="1190" y="327" class="s">[req_slots, ring4, 512] FP32</text>
-  <rect x="1010" y="380" width="360" height="82" class="box changed"/><text x="1190" y="411" class="t">C128A Attention State</text><text x="1190" y="437" class="s">[req_slots, ring128, 1024] FP32</text>
+  <rect x="300" y="130" width="270" height="100" class="box reused"/><text x="435" y="169" class="t">full loc → SWA loc</text><text x="435" y="196" class="s">C4A / C4Li 地址来源</text>
+  <rect x="300" y="310" width="270" height="100" class="box reused"/><text x="435" y="349" class="t">req_pool_idx + position</text><text x="435" y="376" class="s">C128A 地址来源</text>
 
-  <rect x="1480" y="180" width="300" height="145" class="box changed"/><text x="1630" y="218" class="t">custom.compressor</text><text x="1630" y="247" class="s">state_block_table=bank</text><text x="1630" y="274" class="s">cache_mode=2</text><text x="1630" y="299" class="s">算子计算 ring offset</text>
-  <rect x="1480" y="395" width="300" height="100" class="box reused"/><text x="1630" y="433" class="t">NPU Epilog</text><text x="1630" y="460" class="s">写 C4/C128 KV 或 Index K/scale</text>
-  <rect x="1830" y="285" width="140" height="110" class="box result"/><text x="1900" y="326" class="t">结果</text><text x="1900" y="353" class="s">KV 输出</text><text x="1900" y="378" class="s">Ring state</text>
+  <rect x="630" y="130" width="300" height="100" class="box reused"/><text x="780" y="163" class="t">[复用 GPU] C4 state_loc</text><text x="780" y="188" class="s">full→SWA→translate</text><text x="780" y="212" class="s">ratio=4 临时调用 tensor</text>
+  <rect x="630" y="310" width="300" height="100" class="box reused"/><text x="780" y="343" class="t">[复用 GPU] C128 state_loc</text><text x="780" y="368" class="s">req + position→translate</text><text x="780" y="392" class="s">ratio=128 临时调用 tensor</text>
 
-  <path d="M250 215 H300" class="edge"/><path d="M250 245 H275 V317 H300" class="edge"/><path d="M550 175 H610" class="edge"/><path d="M900 175 H930 V252 H1480" class="edge"/><path d="M550 317 H1480" class="edge"/>
-  <path d="M1370 201 H1425 V225 H1480" class="edge"/><path d="M1370 311 H1445 V252 H1480" class="edge"/><path d="M1370 421 H1425 V280 H1480" class="edge"/>
-  <path d="M1630 325 V395" class="edge"/><path d="M1780 445 H1805 V340 H1830" class="edge"/>
+  <rect x="990" y="95" width="410" height="400" class="group"/><text x="1195" y="123" class="t">复用 GPU CompressStatePool</text><text x="1195" y="145" class="s">NPU 仅适配 FP32 / 3-D view / dummy</text>
+  <rect x="1025" y="165" width="340" height="82" class="box reused"/><text x="1195" y="196" class="t">C4A Attention State</text><text x="1195" y="222" class="s">SWA page × c4_ring_size × 2048</text>
+  <rect x="1025" y="275" width="340" height="82" class="box reused"/><text x="1195" y="306" class="t">C4Li Indexer State</text><text x="1195" y="332" class="s">SWA page × c4_ring_size × 512</text>
+  <rect x="1025" y="385" width="340" height="82" class="box reused"/><text x="1195" y="416" class="t">C128A Attention State</text><text x="1195" y="442" class="s">request × c128_ring_size × 1024</text>
 
-  <rect x="610" y="520" width="800" height="60" class="box added"/><text x="1010" y="546" class="t">Bank 生命周期</text><text x="1010" y="568" class="s">新 request 取得 slot 时清 bank；chunked prefill / decode / verify 保持 bank 不变；下次 slot 复用前再清</text>
+  <rect x="1460" y="185" width="300" height="160" class="box changed"/><text x="1610" y="218" class="t">A3 adapter + compressor</text><text x="1610" y="247" class="s">调用前临时组装二维 table</text><text x="1610" y="274" class="s">state_block_table=state_loc</text><text x="1610" y="301" class="s">cache_mode=2</text><text x="1610" y="328" class="s">无长期 loc/request table</text>
+  <rect x="1460" y="410" width="300" height="100" class="box reused"/><text x="1610" y="448" class="t">NPU Epilog</text><text x="1610" y="475" class="s">写 C4/C128 KV 或 Index K/scale</text>
+  <rect x="1815" y="270" width="150" height="120" class="box result"/><text x="1890" y="312" class="t">结果</text><text x="1890" y="340" class="s">compressed KV</text><text x="1890" y="366" class="s">+ state rows</text>
+
+  <path d="M250 250 H275 V180 H300" class="edge"/><path d="M250 290 H275 V360 H300" class="edge"/>
+  <path d="M570 180 H630" class="edge"/><path d="M570 360 H630" class="edge"/>
+  <path d="M930 180 H960 V240 H1460" class="edge"/><path d="M930 360 H960 V290 H1460" class="edge"/>
+  <path d="M1365 196 H1425 V230 H1460" class="edge"/><path d="M1365 306 H1425 V265 H1460" class="edge"/><path d="M1365 416 H1425 V305 H1460" class="edge"/>
+  <path d="M1610 345 V410" class="edge"/><path d="M1760 460 H1785 V330 H1815" class="edge"/>
+
+  <rect x="300" y="555" width="700" height="64" class="box reused"/><text x="650" y="581" class="t">C4A / C4Li 生命周期</text><text x="650" y="604" class="s">不按新 request 清 bank；只维持 dummy/sentinel row，当前 token 写入时覆盖有效 row</text>
+  <rect x="1050" y="555" width="710" height="64" class="box changed"/><text x="1405" y="581" class="t">C128A 生命周期</text><text x="1405" y="604" class="s">新 request 首次取得或复用 req_pool_idx 时清对应 C128 bank；同 request 多轮不重复清</text>
 </svg>
