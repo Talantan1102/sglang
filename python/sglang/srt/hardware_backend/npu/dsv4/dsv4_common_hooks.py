@@ -10,8 +10,8 @@ these hooks then:
   2. Write the independently allocated C128 KV slots into the per-request table.
 
 Compressor state is fixed ring storage and does not participate in this
-allocation/write path. Legacy state-table PD/Graph readers are removed by the
-later consumer subchanges.
+allocation/write path. PD reuses the public SWA/C128-state payloads and only
+builds an NPU-specific payload for the independently addressed C128 KV pool.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -68,19 +68,10 @@ def dsv4_state_payloads(
     req_pool_idx: int,
     seq_len: int,
     page_size: int,
-    window_size: int,
     *,
-    translate_loc_from_full_to_swa,
     prefix_len: int = 0,
 ):
-    """Per-StateType PD-payload builders for DSV4-on-NPU.
-
-    For chunked prefill, intermediate chunks can leave old C4/C128 state pages in
-    the req table. PD only needs the final active tail state; scanning the whole
-    prompt span would transfer stale state pages and can perturb decode accuracy.
-    """
-    if not hasattr(req_to_token_pool, "req_to_token_c128"):
-        return {}
+    """Build the only NPU-specific DSV4 PD payload: C128 KV pages."""
 
     import numpy as np
 
@@ -89,94 +80,21 @@ def dsv4_state_payloads(
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
 
-    def empty_pages():
-        return np.empty((0,), dtype=np.int32)
-
-    def pages(
-        table,
-        lo: int,
-        hi: int,
-        *,
-        translate_loc=None,
-        drop_zero_pages: bool = False,
-    ):
+    def c128_kv_pages():
+        lo = prefix_len // 128
+        hi = seq_len // 128
         if hi <= lo:
-            return empty_pages()
+            return np.empty((0,), dtype=np.int32)
 
-        lo = max(0, int(lo))
-        hi = max(lo, int(hi))
         page_lo = (lo // page_size) * page_size
         page_hi = ((hi + page_size - 1) // page_size) * page_size
-        if page_hi <= page_lo:
-            return empty_pages()
+        slots = req_to_token_pool.req_to_token_c128[
+            req_pool_idx, page_lo:page_hi:page_size
+        ]
+        pages = (slots.cpu().numpy() // page_size).astype(np.int32)
+        return pages[pages > 0]
 
-        slots = table[req_pool_idx, page_lo:page_hi:page_size]
-        if translate_loc is not None:
-            slots = translate_loc(slots)
-        slots = slots.cpu().numpy()
-        if slots.size == 0:
-            return empty_pages()
-
-        page_indices = (slots // page_size).astype(np.int32)
-        if drop_zero_pages:
-            page_indices = page_indices[page_indices > 0]
-        return page_indices
-
-    def state_tail_range(compress_ratio: int):
-        tail_len = seq_len % 128
-        if compress_ratio == 4:
-            state_len = tail_len + 128 if tail_len <= 3 and seq_len >= 128 else tail_len
-        elif compress_ratio == 128:
-            state_len = tail_len
-        else:
-            raise ValueError(f"Unsupported DSV4 state compress ratio: {compress_ratio}")
-
-        if state_len == 0:
-            return None
-
-        start = max(prefix_len, seq_len - state_len)
-        if start >= seq_len:
-            return None
-        return start, seq_len
-
-    def state_pages(table, compress_ratio: int):
-        state_range = state_tail_range(compress_ratio)
-        if state_range is None:
-            return empty_pages()
-        lo, hi = state_range
-        return pages(table, lo, hi, drop_zero_pages=True)
-
-    if window_size is None or window_size <= 0:
-        window_start = prefix_len
-    else:
-        window_start = max(prefix_len, seq_len - window_size)
-    window_start = (window_start // page_size) * page_size
-
-    # DSV4_INDEXER shares the c4 slot space (written at the c4 loc).
-    return {
-        AscendStateType.DSV4_SWA: lambda: pages(
-            req_to_token_pool.req_to_token,
-            window_start,
-            seq_len,
-            translate_loc=translate_loc_from_full_to_swa,
-            drop_zero_pages=True,
-        ),
-        AscendStateType.DSV4_C4: lambda: pages(
-            req_to_token_pool.req_to_token, prefix_len, seq_len
-        ),
-        AscendStateType.DSV4_C128: lambda: pages(
-            req_to_token_pool.req_to_token_c128, prefix_len // 128, seq_len // 128
-        ),
-        AscendStateType.DSV4_INDEXER: lambda: pages(
-            req_to_token_pool.req_to_token, prefix_len, seq_len
-        ),
-        AscendStateType.DSV4_C4_STATE: lambda: state_pages(
-            req_to_token_pool.req_to_token_c4_state, 4
-        ),
-        AscendStateType.DSV4_C128_STATE: lambda: state_pages(
-            req_to_token_pool.req_to_token_c128_state, 128
-        ),
-    }
+    return {AscendStateType.DSV4_C128: c128_kv_pages}
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
@@ -241,6 +159,7 @@ def _write_dsv4_tables(
         bundle.out_c128_loc,
         ratio=128,
     )
+
 
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,

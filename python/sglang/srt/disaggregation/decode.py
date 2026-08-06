@@ -1224,11 +1224,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         decode_req.req.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
-                        self.scheduler.sliding_window_size,
                         prefix_len=total_prefix_len,
-                        translate_loc_from_full_to_swa=(
-                            self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa
-                        ),
                     )
                 )
             state_indices: Optional[List] = [

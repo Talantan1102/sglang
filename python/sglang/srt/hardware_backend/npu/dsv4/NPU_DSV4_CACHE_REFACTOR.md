@@ -662,12 +662,14 @@ flowchart LR
 
 本子改动必须放在子改动 1–3 之后：只有单机 Eager、Graph/MTP 都已经使用 GPU 风格的显式 `state_loc`，PD 才能安全复用 GPU 的 StateType 和 payload 语义。若在 paged state 仍生效时提前把 C4 state 合入 `StateType.SWA`，connector 会拿 SWA 地址访问独立 paged state，造成地址错配。
 
+> 实现状态（2026-08-06）：已完成。PD 公共组件已复用 GPU StateType/传输路径，NPU 只保留 C128 KV 特例；PP 切片和 NextN/MTP SWA 注册已补定向测试。
+
 - C4 KV 和 Indexer K/scale 进入 GPU 已有的主 KV 传输列表，使用改动一收敛后的 full page index；删除 `DSV4_C4`、`DSV4_INDEXER` 两个 Ascend 专用 StateType。
 - SWA KV、C4A state 和 C4Li state 合并注册为同一个 `StateType.SWA` component。三类 buffer 仍然独立，只共享同一组 SWA/state index；删除 `DSV4_SWA`、`DSV4_C4_STATE`。
 - C128A compressor state 直接复用公共 `StateType.C128_STATE`；删除 `DSV4_C128_STATE`。
 - C128 KV 仍由 `req_to_token_c128` 和独立 allocator 管理，不能进入使用 full index 的主 KV 列表，因此只保留一个 NPU 专用类型 `AscendStateType.DSV4_C128`。
 - Python `Enum` 不能继承已有成员的 `StateType` 后再添加枚举值，因此不实现 `class AscendStateType(StateType)`。公共 component 直接使用 `StateType`；`AscendStateType` 是只包含 `DSV4_C128` 的小枚举。
-- `get_contiguous_buf_infos()` 注册 C4/Indexer 主 KV buffer；`get_pd_state_components()` 只注册 `StateType.SWA`、`StateType.C128_STATE` 和 `AscendStateType.DSV4_C128`。`dsv4_state_payloads()` 同步只生成这三类 payload。
+- `get_contiguous_buf_infos()` 注册 C4/Indexer 主 KV buffer；公共 `get_state_buf_infos()` 注册 `StateType.SWA`，继承的 `get_c128_state_buf_infos()` 注册 `StateType.C128_STATE`，新增 `get_c128_kv_buf_infos()` 注册 `AscendStateType.DSV4_C128`。`dsv4_state_payloads()` 只生成最后这一类 NPU 专用 payload。
 - `_DSV4_KVCACHE_STATE_TYPES` 收缩为 `(AscendStateType.DSV4_C128,)`；删除 C4/Indexer/SWA/C4-state/C128-state 的 Ascend 专用 dispatch 和 exact-index 分支，复用 GPU connector 的通用处理。
 - 覆盖 StateType 顺序、C4/Indexer 主 KV buffer 注册、SWA+C4A+C4Li 多 buffer 共用 index、C128A 公共 state payload、NPU C128 KV 独立 payload，以及 PD 传输后继续 decode/MTP。
 
@@ -706,7 +708,9 @@ flowchart LR
     SharedC128State["[复用] StateType.C128_STATE<br/>C128A state"]:::reused
     NPUC128["[保留] AscendStateType.DSV4_C128<br/>独立 C128 KV index"]:::changed
     DeleteTypes["[删除] 其余 5 个<br/>Ascend 专用 StateType/dispatch"]:::deleted
-    Connector["[复用] GPU 通用 connector<br/>按 component 传输"]:::reused
+    DeleteTables["[删除] req_to_token_c4_state<br/>req_to_token_c128_state"]:::deleted
+    NextN["[复用] NextN/MTP draft SWA<br/>第二个 StateType.SWA component"]:::reused
+    Connector["[复用] GPU 通用 connector<br/>按 component 传输 + PP 切片"]:::reused
     Result["结果：公共类型全部复用 GPU<br/>Ascend 只保留 C128 KV 特例"]:::result
 
     Full --> MainKV --> Connector
@@ -714,6 +718,8 @@ flowchart LR
     SharedC128State --> Connector
     NPUC128 --> Connector --> Result
     DeleteTypes --> Result
+    DeleteTables --> Result
+    NextN --> Connector
 
     classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
     classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
@@ -729,7 +735,7 @@ flowchart LR
 | 3. Graph/MTP ring | `ascend_dsv4_backend.py` | 复用子改动 2 字典/helper、GPU pool translate、公共 ring size 和现有 speculative runtime；Graph 增加固定 tensor 原地刷新，删除旧 state page/loc buffer；PD table 留到子改动 4 删除 | replay loc、draft loc、runtime accepted 长度、rejected 自然覆盖、Graph/MTP 无 paged state consumer |
 | 4. PD/StateType 收敛 | `dsv4_memory_pool.py`、`dsv4_common_hooks.py`、`disaggregation/ascend/conn.py`、`disaggregation/utils.py` | 公共 component 复用 GPU StateType/主 KV 路径；Ascend 只保留 C128 KV | 类型顺序与 payload 对齐，传输后 C4/C128/Indexer/state 一致 |
 
-> 当前代码索引：[GPU 公共 `CompressStatePool`](../../../mem_cache/deepseek_v4_compress_state.py#L82-L213) · [NPU 薄适配与 factory](dsv4_memory_pool.py#L69-L327) · [KV-only allocator bundle](dsv4_allocator.py#L122-L390) · [过渡期 state table/graph metadata](../attention/ascend_dsv4_backend.py#L240-L1408) · [fused compressor 调用](../attention/ascend_dsv4_backend.py#L370-L430)
+> 当前代码索引：[GPU 公共 `CompressStatePool`](../../../mem_cache/deepseek_v4_compress_state.py#L82-L213) · [NPU 薄适配与 factory](dsv4_memory_pool.py#L69-L327) · [KV-only allocator bundle](dsv4_allocator.py#L122-L390) · [显式 state loc/graph metadata](../attention/ascend_dsv4_backend.py#L240-L1408) · [fused compressor 调用](../attention/ascend_dsv4_backend.py#L370-L430)
 
 ## 4. MTP 相关适配
 
@@ -932,11 +938,11 @@ flowchart LR
 | C4A/C4Li state | `AscendStateType.DSV4_C4_STATE` | `StateType.SWA`，使用与 GPU 相同的 SWA/state index |
 | C128A state | `AscendStateType.DSV4_C128_STATE` | 公共 `StateType.C128_STATE` |
 
-`get_pd_state_components()` 允许一个 StateType component 注册多个独立物理 tensor，因此 `StateType.SWA` 可以同时包含 SWA KV、C4A state 和 C4Li state；共享类型不等于合并 buffer。C4 KV 与 Indexer 则从 state component 移入 `get_contiguous_buf_infos()` 返回的主 KV 列表。
+`get_state_buf_infos()` 允许一个 StateType component 注册多个独立物理 tensor，因此 `StateType.SWA` 可以同时包含 SWA KV、C4A state 和 C4Li state；共享类型不等于合并 buffer。C4 KV 与 Indexer 则进入 `get_contiguous_buf_infos()` 返回的主 KV 列表。
 
 `AscendStateType` 不做对 `StateType` 的 Python 枚举继承，因为已有成员的 `Enum` 不能被扩展。公共类型直接使用 `StateType`，Ascend 小枚举只定义 `DSV4_C128`。相应地，`_DSV4_KVCACHE_STATE_TYPES` 只保留这一项，其他 component 由 GPU 通用 connector 分发。
 
-此时 Prefill/Decode 的 payload、item length 和 index 配对规则直接复用 GPU 实现；NPU 只为 C128 KV 构造独立 page list。PD 传输后按 committed sequence length 继续 decode，不恢复已删除的 state request table 或 cursor。
+此时 Prefill/Decode 的 SWA/C128-state payload、item length 和 index 配对规则直接复用 GPU 实现；NPU 只为 C128 KV 构造独立 page list。Graph 不参与 PD buffer 注册；MTP/NextN 继续以第二个公共 `StateType.SWA` component 传输 draft SWA buffer。PD 传输后按 committed sequence length 继续 decode，不恢复已删除的 state request table 或 cursor。
 
 > 当前代码索引：[DSV4 PD payload](dsv4_common_hooks.py#L84-L197) · [PD 预分配适配](dsv4_common_hooks.py#L200-L290) · [PD buffer 注册](../../../disaggregation/utils.py#L960-L1001) · [Ascend StateType 与分发](../../../disaggregation/ascend/conn.py#L23-L43) · [exact-index 校验](../../../disaggregation/ascend/conn.py#L38-L43)
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1580" height="570" viewBox="0 0 1580 570" role="img" aria-labelledby="title desc">
   <title id="title">子改动四重构后：PD 与 StateType 收敛</title>
-  <desc id="desc">C4、Indexer、SWA 和 compressor state 复用 GPU 通用类型和传输路径，Ascend 只保留 C128 KV 特例。</desc>
+  <desc id="desc">C4、Indexer、SWA 和 compressor state 复用 GPU 通用类型和传输路径，删除两张 state request table，Ascend 只保留 C128 KV 特例。</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -40,10 +40,10 @@
   <text x="485" y="476"><tspan x="485">[保留] AscendStateType.DSV4_C128</tspan><tspan x="485" dy="24">独立 C128 KV index</tspan></text>
 
   <rect class="deleted" x="690" y="438" width="270" height="88" rx="4"/>
-  <text x="825" y="476"><tspan x="825">[删除] 其余 5 个</tspan><tspan x="825" dy="24">Ascend 专用 StateType/dispatch</tspan></text>
+  <text x="825" y="464"><tspan x="825">[删除] 其余 5 个</tspan><tspan x="825" dy="24">Ascend 专用 StateType/dispatch</tspan><tspan x="825" dy="24">+ 两张 state request table</tspan></text>
 
   <rect class="reused" x="990" y="238" width="230" height="88" rx="4"/>
-  <text x="1105" y="276"><tspan x="1105">[复用] GPU 通用 connector</tspan><tspan x="1105" dy="24">按 component 传输</tspan></text>
+  <text x="1105" y="264"><tspan x="1105">[复用] GPU 通用 connector</tspan><tspan x="1105" dy="24">按 component 传输</tspan><tspan x="1105" dy="24">含 PP / NextN SWA</tspan></text>
   <rect class="result" x="1280" y="238" width="280" height="88" rx="4"/>
   <text x="1420" y="276"><tspan x="1420">公共类型全部复用 GPU</tspan><tspan x="1420" dy="24">Ascend 只保留 C128 KV 特例</tspan></text>
 </svg>

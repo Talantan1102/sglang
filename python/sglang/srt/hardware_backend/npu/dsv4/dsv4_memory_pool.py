@@ -338,79 +338,51 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        # No full-token contiguous space on NPU; everything ships per-pool via
-        # get_pd_state_components(), so the contiguous path is empty.
-        return [], [], []
-
-    def get_pd_state_components(
-        self,
-    ) -> List[Tuple[str, List[int], List[int], List[int]]]:
-        """Ordered ``(AscendStateType, data_ptrs, data_lens, item_lens)`` per pool, in a
-        fixed order so prefill and decode register identically (empty pools skipped)."""
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
-        components: List[Tuple[str, List[int], List[int], List[int]]] = []
-
-        def kv_entry(bufs):
-            return (
-                [b.data_ptr() for b in bufs],
-                [b.nbytes for b in bufs],
-                [b[0].nbytes for b in bufs],
-            )
-
-        def state_entry(want_ratio: int, include_indexer: bool):
-            ptrs: List[int] = []
-            lens: List[int] = []
-            ilens: List[int] = []
-
-            def add(pool):
-                t = pool.kv_score_buffer.kv_score
-                ptrs.append(t.data_ptr())
-                lens.append(t.nbytes)
-                ilens.append(t[0].nbytes * pool.ring_size)
-
-            for ratio, pool in zip(self.compression_ratios, self.compress_state_pools):
-                if pool is not None and ratio == want_ratio:
-                    add(pool)
-            if include_indexer:
-                # Indexer state pools are all ratio 4 and share C4A's SWA-derived
-                # state_loc values, while retaining separate physical tensors.
-                for pool in self.indexer_compress_state_pools:
-                    if pool is not None:
-                        add(pool)
-            return ptrs, lens, ilens
-
-        # KV pools (4D PA_ND).
-        if self.swa_kv_pool is not None:
-            components.append(
-                (AscendStateType.DSV4_SWA, *kv_entry(self.swa_kv_pool.kv_buffer))
-            )
-        if self.c4_kv_pool is not None:
-            components.append(
-                (AscendStateType.DSV4_C4, *kv_entry(self.c4_kv_pool.kv_buffer))
-            )
-        if self.c128_kv_pool is not None:
-            components.append(
-                (AscendStateType.DSV4_C128, *kv_entry(self.c128_kv_pool.kv_buffer))
-            )
-        if self.c4_indexer_kv_pool is not None:
-            idx_bufs = list(self.c4_indexer_kv_pool.index_k_buffer) + list(
-                self.c4_indexer_kv_pool.index_scale_buffer
-            )
-            components.append((AscendStateType.DSV4_INDEXER, *kv_entry(idx_bufs)))
-
-        # Transitional Ascend StateTypes remain until subchange 4; buffers are
-        # already fixed rings. C4A/C4Li share SWA-derived indices.
-        components.append(
-            (AscendStateType.DSV4_C4_STATE, *state_entry(4, include_indexer=True))
+        """Main PD buffers addressed by the full KV page id."""
+        buffers = (
+            self.c4_kv_pool.kv_buffer
+            + self.c4_indexer_kv_pool.index_k_buffer
+            + self.c4_indexer_kv_pool.index_scale_buffer
         )
-        components.append(
-            (AscendStateType.DSV4_C128_STATE, *state_entry(128, include_indexer=False))
+        return (
+            [buf.data_ptr() for buf in buffers],
+            [buf.nbytes for buf in buffers],
+            [buf[0].nbytes for buf in buffers],
         )
 
-        # Drop empty components (e.g. a ratio with no layers) so every shipped
-        # component has non-zero item_lens; the set is identical on both sides.
-        return [c for c in components if c[1]]
+    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """GPU-compatible ``StateType.SWA`` component.
+
+        SWA KV, C4 attention state and C4 indexer state retain separate buffers
+        but share the same SWA page/state index.
+        """
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+
+        for buf in self.swa_kv_pool.kv_buffer:
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
+
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            for pool in pools:
+                if pool is None or pool.ratio != 4:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                data_ptrs.append(state.data_ptr())
+                data_lens.append(state.nbytes)
+                item_lens.append(state[0].nbytes * pool.ring_size)
+
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_kv_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        buffers = self.c128_kv_pool.kv_buffer
+        return (
+            [buf.data_ptr() for buf in buffers],
+            [buf.nbytes for buf in buffers],
+            [buf[0].nbytes for buf in buffers],
+        )
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
