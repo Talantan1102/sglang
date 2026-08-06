@@ -522,9 +522,10 @@ flowchart LR
 
 #### 3.2.2 子改动 2：Eager ring 切换与 Eager paged metadata 删除
 
-- `forward_compress()` 固定传 `cache_mode=2`；复用已有 `get_state_cache(layer_id, is_in_indexer)` 路由取得当前层的 C4A、C4Li 或 C128A pool，不新增选择函数。
+- `forward_compress()` 固定传 `cache_mode=2`；复用已有 `_get_state_pool()/get_state_cache(layer_id, is_in_indexer)` 路由取得当前层的 C4A、C4Li 或 C128A pool，不新增选择函数。
 - 抽取一个按 `ratio` 工作的公共显式地址组装 helper。它复用 GPU `CompressStatePool` 的两种 translate 方法、full→SWA mapping 和现有 req/position metadata，只负责把结果整理为 A3 接口要求的二维 `state_block_table`，不在 NPU 重写 ring 寻址公式。
 - 每个 Eager batch、每个 ratio 只组装一次临时调用 tensor：ratio=4 的结果供 C4A/C4Li 共用，ratio=128 的结果供 C128A 使用。它们可以作为本轮 `ForwardMetadata` 的临时计算结果缓存，避免逐层重复生成，但不新增任何长期 state-loc request 字段、allocator 或 ownership。
+- 本轮最大输入容量在 metadata 阶段由已有 CPU 长度直接得到：decode 为 1，prefill 为最大 request chunk，verify 为 draft 宽度；地址 helper 不对 NPU `cu_seqlens` 调 `.item()`，避免每轮 decode 引入主机同步。
 - 临时 tensor 的宽度是 `coff * cmp_ratio + input_capacity`；历史列和当前 token 列都填 flat INT32 `state_loc`。这个二维载体由新版 A3 ABI 决定，不能继续把一维 `req_pool_idx` 直接当作 `state_block_table`。
 - 同步删除 Eager 路径的 state loc 写表 hook、`c4_state_page_table/c128_state_page_table` 构造与消费；prefill 显式设置 `seqused=cu_seqlens[1:]-cu_seqlens[:-1]`。
 - 保留 RoPE、Hadamard、输出长度检查和 `_compressor_epilog_npu()`，避免把 state 重构扩散到 compressed KV 写入链路。

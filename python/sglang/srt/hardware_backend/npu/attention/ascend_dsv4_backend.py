@@ -64,6 +64,47 @@ def _overlap_transform(
     return out
 
 
+def _build_explicit_state_block_table(
+    *,
+    compress_ratio: int,
+    coff: int,
+    state_pool,
+    token_to_kv_pool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    start_pos: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seqused: torch.Tensor,
+    max_input_capacity: int,
+) -> torch.Tensor:
+    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    req_pool_indices = req_pool_indices.to(torch.int64)
+    capacities = cu_seqlens[1:] - cu_seqlens[:-1]
+    history_size = coff * compress_ratio
+    width = history_size + max_input_capacity
+    columns = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
+    positions = start_pos[:, None] - history_size + columns
+    within_capacity = columns[None, :] < history_size + capacities[:, None]
+    valid = (seqused[:, None] > 0) & within_capacity & (positions >= 0)
+
+    if compress_ratio == 4:
+        # Masked history/ragged columns are still indexed before torch.where.
+        safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
+        full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
+        swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
+        state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+    else:
+        state_locs = state_pool.translate_from_req_position_to_state_loc(
+            req_pool_indices[:, None], positions
+        )
+
+    return torch.where(
+        valid,
+        state_locs.to(torch.int32),
+        state_pool.dummy_state_loc,
+    ).contiguous()
+
+
 class CompressorAscendBackendMixin(CompressorBackendMixin):
 
     @staticmethod
@@ -98,6 +139,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
+        fm.dsv4_explicit_state_block_tables = {}
+        fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
@@ -119,8 +162,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if not is_decode:
             for ratio in self._dsv4_compress_ratios:
                 if ratio in (4, 128):
-                    if f"c{ratio}_state_loc" not in result:
-                        setattr(fm, f"c{ratio}_state_loc", None)
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
@@ -144,6 +185,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
+        fm.dsv4_max_input_capacity = max(
+            1,
+            max(
+                (int(cu_cpu[idx + 1]) - int(cu_cpu[idx]) for idx in range(bs)),
+                default=0,
+            ),
+        )
         prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
@@ -182,10 +230,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 padding[: cat.shape[0]].copy_(cat)
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
 
-        # start_pos = each req's GLOBAL start (= extend_prefix_lens) so the fused op
-        # (cache_mode=1) reads the prior-chunk partial-block state and aligns blocks
-        # to the global grid; prefix==0 -> 0 (non-chunked, unchanged). Only the fused
-        # chunked path reads it. seqused=None -> op derives chunk len from cu_seqlens.
+        # start_pos is each request's global chunk start. cache_mode=2 uses it
+        # together with the explicit table to align history/current columns.
         if forward_batch.extend_prefix_lens is not None:
             fm.start_pos = forward_batch.extend_prefix_lens.to(
                 device=device, dtype=torch.int32
@@ -198,7 +244,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             )
         else:
             fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
-        fm.seqused = None
+        fm.seqused = (cu[1:] - cu[:-1]).to(torch.int32)
 
         # bundle out_c*_loc = the NEW c-pool slots allocated this extend (incremental),
         # densely packed in batch order to match cmp_kv. Valid under chunked prefill:
@@ -217,27 +263,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 f"c{ratio}_loc",
                 bundle_loc.to(torch.int32) if bundle_loc is not None else None,
             )
-
-        # req_to_token_c*_state is not re-zeroed on slot reuse; zero pre-tail page cols so the kernel block-0 skip masks stale entries
-        page_size = self.page_size
-        for ratio in (4, 128):
-            spt = getattr(fm, f"c{ratio}_state_page_table", None)
-            if spt is None:
-                continue
-            for idx in range(bs):
-                chunk_len = int(cu_cpu[idx + 1] - cu_cpu[idx])
-                if chunk_len == 0:
-                    continue
-                seqlen = int(prefix_cpu[idx]) + chunk_len
-                tail = seqlen % 128
-                if ratio == 4:
-                    c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
-                else:
-                    c_alloc_len = tail
-                c_alloc_offset = seqlen - c_alloc_len
-                first_tail_page = c_alloc_offset // page_size
-                if first_tail_page > 0:
-                    spt[idx, :first_tail_page] = 0
 
     def _compute_compress_locs(
         self,
@@ -263,22 +288,10 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             seq_lens_max = int(seq_lens_max_override)
         else:
             seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
-        n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
-
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
             bundle_loc = None
-            # state table holds one slot per RAW token; block 0 is the skip sentinel reserved by NPUCompressStatePool
-            state_table = (
-                req_to_token_pool.req_to_token_c4_state
-                if ratio == 4
-                else req_to_token_pool.req_to_token_c128_state
-            )
-            state_slots_2d = state_table[req_pool_64, : n_pages * self.page_size]
-            state_page_2d = (state_slots_2d[:, :: self.page_size] // self.page_size).to(
-                torch.int32
-            )
 
             if is_decode:
                 # bundle_loc and cmp_kv are both densely packed in batch order, so
@@ -290,7 +303,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         else out_cache_loc_dsv4.out_c128_loc
                     )
 
-            result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
                 compress_out_loc = torch.zeros(
                     bs,
@@ -365,28 +377,31 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         self._ensure_fused_caches(compressor)
 
         fm = self.forward_metadata
-        positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
-        page_table = getattr(fm, f"c{ratio}_state_page_table", None)
-        start_pos = getattr(fm, "start_pos", None)
-        seqused = getattr(fm, "seqused", None)
-        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
-        assert positions_cmp is not None and page_table is not None, (
-            "fused compressor needs backend metadata "
-            "(positions_cmp_padding / c*_state_page_table) — make sure "
-            "_build_npu_compress_metadata ran before this forward."
-        )
-        assert start_pos is not None, "fused compressor needs start_pos"
-        assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
-
         pool = self.token_to_kv_pool
-        state_cache = pool.get_state_cache(
+        state_pool = pool._get_state_pool(
             compressor.layer_id, compressor.is_in_indexer
         )
+        state_cache = state_pool.state_cache_3d
+        table_cache = fm.dsv4_explicit_state_block_tables
+        if ratio not in table_cache:
+            table_cache[ratio] = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=coff,
+                state_pool=state_pool,
+                token_to_kv_pool=pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                start_pos=fm.start_pos,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
+                seqused=fm.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+        state_block_table = table_cache[ratio]
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
         ).get_cos_sin(
-            positions_cmp,
+            getattr(fm, f"positions_cmp_padding_c{ratio}"),
             torch.float32,
             view_4d=False,
             allow_build=False,
@@ -403,14 +418,14 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             rope_cos=cos,
             rope_head_dim=compressor.rope_head_dim,
             cmp_ratio=ratio,
-            state_block_table=page_table,
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-            start_pos=start_pos,
+            state_block_table=state_block_table,
+            cu_seqlens=fm.actual_seq_lengths_q_pa,
+            seqused=fm.seqused,
+            start_pos=fm.start_pos,
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
-            cache_mode=1,
+            cache_mode=2,
         )
 
         # prefill output may be padded; trim to loc length
@@ -1800,6 +1815,7 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos = forward_batch.seq_lens.to(torch.int32)
         valid = forward_batch.seq_lens[:bs] > 0
         fm.seqused = valid.to(torch.int32) * int(n_draft)
+        fm.dsv4_max_input_capacity = max(1, n_draft)
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:
