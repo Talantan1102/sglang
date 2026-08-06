@@ -10,6 +10,7 @@ sys.modules.setdefault("torch_npu", MagicMock())
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (  # noqa: E402
     CompressorAscendBackendMixin,
+    DeepseekV4AscendAttnBackend,
     _build_explicit_state_block_table,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (  # noqa: E402
@@ -142,6 +143,122 @@ class TestNPUCompressStatePool(unittest.TestCase):
 
 
 class TestExplicitStateBlockTable(unittest.TestCase):
+    def test_graph_metadata_uses_fixed_explicit_tables(self):
+        backend = object.__new__(DeepseekV4AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.speculative_num_draft_tokens = 3
+        backend._dsv4_unique_compress_ratios = (4, 128)
+        backend._dsv4_index_topk = 2
+        c4_state_pool = SimpleNamespace(ratio=4, dummy_state_loc=40)
+        c128_state_pool = SimpleNamespace(ratio=128, dummy_state_loc=1280)
+        backend._dsv4_state_pools_by_ratio = {
+            4: c4_state_pool,
+            128: c128_state_pool,
+        }
+        metadata = SimpleNamespace()
+        backend.graph_metadata = {
+            2: metadata,
+            "swa_page_table": torch.zeros((2, 4), dtype=torch.int32),
+            "c4_page_table": torch.zeros((2, 4), dtype=torch.int32),
+            "c128_page_table": torch.zeros((2, 4), dtype=torch.int32),
+            "kernel_metadata_c1a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c4a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c128a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_li_quant": torch.zeros(1024, dtype=torch.int32),
+            "c4_topk_indices": torch.zeros((6, 2), dtype=torch.int32),
+        }
+        forward_mode = SimpleNamespace(
+            is_target_verify=lambda: True,
+            is_draft_extend_v2=lambda: False,
+        )
+
+        backend._init_dsv4_graph_metadata(2, forward_mode)
+
+        tables = metadata.dsv4_explicit_state_block_tables
+        self.assertEqual(tables[4].shape, (2, 2 * 4 + 3))
+        self.assertEqual(tables[128].shape, (2, 128 + 3))
+        self.assertTrue(torch.all(tables[4] == 40))
+        self.assertTrue(torch.all(tables[128] == 1280))
+        self.assertEqual(metadata.dsv4_max_input_capacity, 3)
+        self.assertFalse(hasattr(metadata, "c4_state_page_table"))
+        self.assertFalse(hasattr(metadata, "c128_state_page_table"))
+        self.assertFalse(hasattr(metadata, "c4_state_loc"))
+        self.assertFalse(hasattr(metadata, "c128_state_loc"))
+
+        backend._dsv4_state_pools_by_ratio = {4: c4_state_pool}
+        backend._init_dsv4_graph_metadata(2, forward_mode)
+        self.assertEqual(set(metadata.dsv4_explicit_state_block_tables), {4})
+
+    def test_graph_verify_refreshes_fixed_table_in_place(self):
+        state_pool = NPUCompressStatePool(
+            size=64,
+            ring_size=8,
+            overlap=True,
+            head_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+            enable_memory_saver=False,
+            ratio=4,
+            swa_page_size=128,
+        )
+        full_to_swa = torch.zeros(65, dtype=torch.int64)
+        full_to_swa[1:] = torch.arange(128, 192, dtype=torch.int64)
+        token_pool = _FakeTokenPool(full_to_swa, state_pool)
+        token_pool.compress_state_pools = [state_pool]
+
+        backend = object.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4,)
+        backend.token_to_kv_pool = token_pool
+        backend._dsv4_state_pools_by_ratio = {4: state_pool}
+        backend.req_to_token = torch.stack(
+            (torch.arange(1, 33), torch.arange(33, 65))
+        )
+
+        fixed_table = torch.full((2, 11), -1, dtype=torch.int32)
+        fm = SimpleNamespace(
+            positions_cmp_padding_c4=torch.zeros(2, dtype=torch.int64),
+            positions_cmp_padding_c128=torch.zeros(2, dtype=torch.int64),
+            c4_loc=torch.zeros(2, dtype=torch.int64),
+            c128_loc=torch.zeros(2, dtype=torch.int64),
+            start_pos=torch.zeros(2, dtype=torch.int32),
+            seqused=torch.zeros(2, dtype=torch.int32),
+            actual_seq_lengths_q_pa=torch.tensor([0, 3, 6], dtype=torch.int32),
+            dsv4_max_input_capacity=3,
+            dsv4_explicit_state_block_tables={4: fixed_table},
+        )
+        forward_batch = SimpleNamespace(
+            positions=torch.arange(6, dtype=torch.int64),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+        )
+        ctx = SimpleNamespace(
+            fm=fm,
+            forward_batch=forward_batch,
+            seq_lens_cpu=torch.tensor([4, 0], dtype=torch.int32),
+            live_seq_lens=torch.tensor([4, 0], dtype=torch.int32),
+            tokens_per_bs=3,
+            bs=2,
+            device=torch.device("cpu"),
+        )
+        fixed_ptr = fixed_table.data_ptr()
+
+        backend._refresh_graph_target_verify_compress_1d_direct(ctx)
+        backend._refresh_graph_explicit_state_block_tables(ctx)
+        first = fixed_table.clone()
+
+        self.assertEqual(fixed_table.data_ptr(), fixed_ptr)
+        self.assertEqual(fm.start_pos.tolist(), [4, 0])
+        self.assertEqual(fm.seqused.tolist(), [3, 0])
+        self.assertTrue(torch.all(fixed_table[1] == state_pool.dummy_state_loc))
+
+        ctx.seq_lens_cpu = torch.tensor([5, 0], dtype=torch.int32)
+        ctx.live_seq_lens = torch.tensor([5, 0], dtype=torch.int32)
+        backend._refresh_graph_target_verify_compress_1d_direct(ctx)
+        backend._refresh_graph_explicit_state_block_tables(ctx)
+
+        self.assertEqual(fixed_table.data_ptr(), fixed_ptr)
+        self.assertFalse(torch.equal(fixed_table[0], first[0]))
+
     def test_prefill_sets_explicit_seqused_from_cu_seqlens(self):
         backend = object.__new__(CompressorAscendBackendMixin)
         backend._dsv4_unique_compress_ratios = (4, 128)

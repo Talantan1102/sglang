@@ -1095,6 +1095,11 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_unique_compress_ratios = list(
             dict.fromkeys(self._dsv4_compress_ratios)
         )
+        self._dsv4_state_pools_by_ratio = {
+            pool.ratio: pool
+            for pool in self.token_to_kv_pool.compress_state_pools
+            if pool is not None
+        }
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
         device = self.device
@@ -1112,12 +1117,6 @@ class DeepseekV4AscendAttnBackend(
         )
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
-        )
-        self.graph_metadata["c4_state_page_table"] = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=device
-        )
-        self.graph_metadata["c128_state_page_table"] = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
@@ -1179,12 +1178,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
         metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
-        metadata.c4_state_page_table = self.graph_metadata["c4_state_page_table"][
-            :bs, :
-        ]
-        metadata.c128_state_page_table = self.graph_metadata["c128_state_page_table"][
-            :bs, :
-        ]
 
         n_tok = bs * tokens_per_req
         c4_pad = min(n_tok, n_tok // 4 + bs)
@@ -1192,8 +1185,19 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
-        metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
+        metadata.dsv4_max_input_capacity = tokens_per_req
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (
+                    bs,
+                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
+                ),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
+            )
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+        }
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1324,16 +1328,9 @@ class DeepseekV4AscendAttnBackend(
             is_graph=True,
             seq_lens_max_override=ctx.compress_seq_lens_max,
         )
-        for key in (
-            "c4_page_table",
-            "c128_page_table",
-            "c4_state_page_table",
-            "c128_state_page_table",
-        ):
+        for key in ("c4_page_table", "c128_page_table"):
             if key in result:
-                self._copy_2d_with_tail(
-                    getattr(ctx.fm, key), result[key], 0 if "state" in key else -1
-                )
+                self._copy_2d_with_tail(getattr(ctx.fm, key), result[key], -1)
 
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1403,13 +1400,29 @@ class DeepseekV4AscendAttnBackend(
             fm.positions_cmp_padding_c128,
             fm.c4_loc,
             fm.c128_loc,
-            fm.c4_state_loc,
-            fm.c128_state_loc,
         ):
             if tensor is not None:
                 tensor.zero_()
         fm.start_pos.zero_()
         fm.seqused.zero_()
+
+    def _refresh_graph_explicit_state_block_tables(self, ctx) -> None:
+        fm = ctx.fm
+        for ratio, fixed_table in fm.dsv4_explicit_state_block_tables.items():
+            fixed_table.copy_(
+                _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=2 if ratio == 4 else 1,
+                    state_pool=self._dsv4_state_pools_by_ratio[ratio],
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            )
 
     def _refresh_graph_swa_metadata_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1462,6 +1475,8 @@ class DeepseekV4AscendAttnBackend(
                 self._clear_graph_target_verify_metadata(ctx)
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
+
+        self._refresh_graph_explicit_state_block_tables(ctx)
 
         self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_kernel_metadata(ctx)

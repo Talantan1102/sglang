@@ -586,16 +586,20 @@ flowchart LR
     classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
 ```
 
-#### 3.2.3 子改动 3：Graph/MTP ring 切换与剩余 paged metadata 删除
+#### 3.2.3 子改动 3：Graph/MTP ring 调用适配与 Graph paged metadata 删除
 
-- Graph 复用子改动 2 的公共地址组装 helper；只有为了满足 capture/replay 的地址稳定约束，才分别分配固定地址的 ratio=4 和 ratio=128 `state_block_table` buffer，replay 只原地 `copy_`。它们是 graph 输入 buffer，不是 request table；idle/padding 行填专用 dummy/sentinel loc，并同步清 `start_pos/seqused`。
-- target verify 使用 `start_pos=committed prefix length`、`seqused=draft token count`，按 draft positions 重新计算本轮显式 loc；C4 继续从对应 full/SWA loc 派生，C128 继续从 request-position 派生。
-- ring size 按最大单次 request token 宽度计算，至少覆盖最大 verify draft 宽度；rejected suffix 不做 state allocator rollback，下一轮从 committed 位置覆盖。
-- 同步删除 Graph 中固定的 `c4/c128_state_page_table`、`c4/c128_state_loc` 及其 refresh/copy 逻辑，并删除 MTP speculative state reserve/rollback/clear 分支。
-- Eager 与 Graph consumer 都移除后，同步删除 `req_to_token_c4_state/req_to_token_c128_state`、`write_c4_state()/write_c128_state()` 及剩余 state write/free hooks；这些删除不再单列子改动。
-- 覆盖 graph 两次动态 replay、真实/idle 混合 batch、非恒等显式 loc、accepted=0/1/中间值/全部接受，并断言单机代码中不存在 state request table/page table/loc consumer。
+> 实现状态（2026-08-06）：已完成。Graph capture 固定 ratio=4/128 显式表，replay 原地刷新；MTP 复用现有 committed `seq_lens`。相关 68 个 NPU 后端/ring 定向测试通过。
 
-本子改动有两路输入：graph replay 的固定 tensor 约束，以及 MTP 的 committed/accepted 长度；结果是 Graph/MTP 与 Eager 使用完全相同的显式 `state_loc` 语义，同时删除单机路径最后的 state request table、page table、loc 和 speculative allocator hook。
+- Graph 直接复用子改动 2 的 `fm.dsv4_explicit_state_block_tables` 字典和公共地址 helper，不新增 `c4_state_block_table/c128_state_block_table` 字段。capture 时在字典的 ratio=4/128 项中保存固定地址 tensor；replay 用同一 helper 生成本轮内容，再对固定 tensor 原地 `copy_`。
+- 地址计算继续直接复用 GPU 公共 `CompressStatePool`：C4 调用 `translate_from_swa_loc_to_state_loc()`，C128 调用 `translate_from_req_position_to_state_loc()`；speculative ring size 继续复用公共 `get_compress_state_ring_size()`，不在 NPU 重写公式或容量规则。
+- target verify 只负责提供 `start_pos=committed prefix length`、`seqused=draft token count` 和本轮 draft 地址。accepted 结果继续由现有 speculative runtime 更新 request `seq_lens`；下一轮 replay 从更新后的 committed length 重新组表，不新增 NPU commit、rollback 或 accepted cursor。
+- idle/padding 行通过 `seqused=0` 复用同一 helper 填 dummy loc，并同步清 `start_pos`；不为 idle 单独实现另一套地址路径。
+- GPU 的 `FusedCompressMetadata/CompressorPlan` 不能直接复用：它保存 `write_loc/extra_data/plan`，而 A3 `cache_mode=2` 要求完整二维 flat `state_loc` 表。Graph 只复用 GPU 的固定 tensor 原地刷新模式，不引入 GPU metadata 类型。
+- 同步删除 Graph 中固定的 `c4/c128_state_page_table`、`c4/c128_state_loc` 及其 refresh/copy 逻辑；ring state 本身不参与 speculative allocator reserve/rollback/clear。
+- `req_to_token_c4_state/req_to_token_c128_state` 已不再被 Eager、Graph 或 MTP 消费，但当前 PD payload 仍读取它们；两张 table 及对应 PD helper 随子改动 4 一起删除，避免本子改动的中间提交破坏 PD。
+- 覆盖 graph 两次动态 replay、真实/idle 混合 batch、非恒等显式 loc、accepted=0/1/中间值/全部接受，并断言 Graph/MTP 不再消费 state request table/page table/loc。
+
+本子改动只新增 Graph 固定地址 tensor 的生命周期适配。state 地址、ring size 和 MTP committed length 分别复用子改动 2、GPU 公共 pool 和现有 speculative runtime；结果是 Graph/MTP 与 Eager 使用同一份显式 `state_loc` 组表逻辑，同时删除 Graph 中最后的 paged state metadata。
 
 重构前，graph 固定持有二维 page table/state loc，MTP 继续预留和回收 speculative state slot：
 
@@ -624,30 +628,30 @@ flowchart LR
     classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
 ```
 
-重构后，graph 仅为地址稳定固定两块二维 A3 调用 buffer；MTP 通过绝对起点、draft 地址和 accepted 长度表达提交/覆盖：
+重构后，Graph 复用子改动 2 的字典保存两个固定 tensor；MTP 的 accepted 长度继续由现有 runtime 管理：
 
 ```mermaid
 flowchart LR
     Capture["输入一：Graph capture<br/>max_graph_bs"]:::neutral
-    C4Buf["[新增 Graph 输入] ratio=4<br/>state_block_table buffer"]:::added
-    C128Buf["[新增 Graph 输入] ratio=128<br/>state_block_table buffer"]:::added
+    TableCache["[复用子改动 2] ForwardMetadata 字典<br/>ratio=4 / 128 固定 tensor"]:::reused
     Replay["[修改] replay 原地 copy_<br/>idle/padding=dummy loc"]:::changed
     Verify["输入二：Target verify<br/>committed length + draft count"]:::neutral
     Meta["[修改] start_pos=committed<br/>seqused=draft count"]:::changed
-    DraftLoc["[复用] 子改动 2 公共 helper<br/>draft SWA/request-position loc"]:::reused
+    GPUAddr["[复用 GPU] CompressStatePool translate<br/>公共 speculative ring size"]:::reused
+    DraftLoc["[复用子改动 2] 公共 helper<br/>二维 flat state_loc"]:::reused
     Op["[修改] graph Compressor<br/>显式 loc table + cache_mode=2"]:::changed
-    Accept["[新增] 下一轮 start_pos<br/>只推进 accepted"]:::added
-    Overwrite["[新增] rejected suffix<br/>同一绝对位置覆盖"]:::added
-    Cleanup["[删除] 旧 paged page/一维 loc buffer<br/>两张 request table 与剩余 hooks"]:::deleted
-    Result["结果：graph/MTP 与 eager 共享 state_loc<br/>单机无 paged state metadata"]:::result
+    Runtime["[复用现有 runtime] accepted<br/>更新 committed seq_lens"]:::reused
+    Overwrite["[自然覆盖] 下一轮重新组表<br/>rejected suffix 无需回滚"]:::reused
+    Cleanup["[删除] Graph 旧 state page table<br/>与一维 state loc buffer"]:::deleted
+    Result["结果：graph/MTP 与 eager 共享 state_loc<br/>不再消费 paged state metadata"]:::result
 
-    Capture --> C4Buf --> Replay --> Op
-    Capture --> C128Buf --> Replay
-    Verify --> Meta --> DraftLoc --> Op --> Accept --> Overwrite --> Result
+    Capture --> TableCache --> Replay --> Op
+    Verify --> Meta --> DraftLoc --> Replay
+    GPUAddr --> DraftLoc
+    Op --> Runtime --> Overwrite --> Result
     Cleanup --> Result
 
     classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
-    classDef added fill:#E8F7EE,stroke:#22A06B,color:#0F172A,stroke-width:1.5px;
     classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
     classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
     classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
@@ -722,14 +726,14 @@ flowchart LR
 | --- | --- | --- | --- |
 | 1. Ring storage ownership | `deepseek_v4_compress_state.py`、`dsv4_memory_pool.py`、`dsv4_allocator.py`、`forward_batch_info.py`、`kv_cache_configurator.py` | 直接复用 GPU `CompressStatePool` 的分配/ring/翻译；NPU 仅保留 FP32、3-D view、dummy 适配；同步删除 paged allocation | GPU/NPU 分配一致、两类地址翻译、仅清 C128 bank、sentinel、KV-only bundle |
 | 2. Eager ring | `ascend_dsv4_backend.py`、Eager hooks | Eager 切新版 `cache_mode=2`；复用 GPU 地址计算，由通用 A3 adapter 按 ratio 临时组装调用 tensor | 三变体、C4A/C4Li 共用 loc、非连续 loc、无长期 loc/request table |
-| 3. Graph/MTP ring | `ascend_dsv4_backend.py`、`dsv4_req_to_token_pool.py`、`dsv4_common_hooks.py`、spec runtime | 复用同一 helper；仅为 Graph 固定并刷新 ratio=4/128 调用 buffer，删除剩余 state table/hooks/rollback | replay loc、draft loc、rejected overwrite、单机无 paged metadata |
+| 3. Graph/MTP ring | `ascend_dsv4_backend.py` | 复用子改动 2 字典/helper、GPU pool translate、公共 ring size 和现有 speculative runtime；Graph 增加固定 tensor 原地刷新，删除旧 state page/loc buffer；PD table 留到子改动 4 删除 | replay loc、draft loc、runtime accepted 长度、rejected 自然覆盖、Graph/MTP 无 paged state consumer |
 | 4. PD/StateType 收敛 | `dsv4_memory_pool.py`、`dsv4_common_hooks.py`、`disaggregation/ascend/conn.py`、`disaggregation/utils.py` | 公共 component 复用 GPU StateType/主 KV 路径；Ascend 只保留 C128 KV | 类型顺序与 payload 对齐，传输后 C4/C128/Indexer/state 一致 |
 
 > 当前代码索引：[GPU 公共 `CompressStatePool`](../../../mem_cache/deepseek_v4_compress_state.py#L82-L213) · [NPU 薄适配与 factory](dsv4_memory_pool.py#L69-L327) · [KV-only allocator bundle](dsv4_allocator.py#L122-L390) · [过渡期 state table/graph metadata](../attention/ascend_dsv4_backend.py#L240-L1408) · [fused compressor 调用](../attention/ascend_dsv4_backend.py#L370-L430)
 
 ## 4. MTP 相关适配
 
-MTP 的 draft、target verify 和 accepted/rejected 处理会同时使用 KV 写地址与 compressor state，因此两项改动都需要适配，但不改变 MTP 的生成、校验和 Indexer top-k 算法。
+MTP 的 draft 和 target verify 会同时使用 KV 写地址与 compressor state，因此需要适配显式 state 表；accepted/rejected 已由现有 speculative runtime 更新 committed `seq_lens`，本重构不修改 MTP 的生成、校验、提交或 Indexer top-k 算法。
 
 这里的 `bundle` 指 [`DSV4OutCacheLoc`](../../../model_executor/forward_batch_info.py#L261-L288)：它不是缓存或映射表，只是一次 forward 使用的 DSV4 写地址集合。改动一后，full loc 成为 SWA/C4 地址的唯一来源；改动二后，state 地址不再放入 bundle。
 
@@ -739,7 +743,8 @@ MTP 的 draft、target verify 和 accepted/rejected 处理会同时使用 KV 写
     → 翻译 SWA loc / 派生 C4 loc
     → 写入本步 KV 和 ring state
     → target verify 使用相同地址规则
-    → accepted/rejected 后提交 KV 长度和 ring state
+    → 现有 runtime 按 accepted 数更新 committed seq_lens
+    → 下一轮按新 seq_lens 重新组表，rejected state 自然覆盖
 ```
 
 | MTP 环节 | 当前方式 | 完成改动一后 | 完成改动二后 |
@@ -748,10 +753,10 @@ MTP 的 draft、target verify 和 accepted/rejected 处理会同时使用 KV 写
 | Draft 地址预留 | [`alloc_paged_token_slots_reserve_extend()`](dsv4_allocator.py#L68-L118) 预留 full/SWA/C4/C128/state 并写各自 request table | 预留 full/SWA/C128 和 paged state；SWA/C4 不再写独立 request table，C4 loc 由 full loc 派生 | 只预留 full/SWA/C128 KV；ring state 使用固定空间，不参与 token allocator 预留 |
 | 多步地址获取 | [`_step_out_cache_loc_dsv4()`](../attention/ascend_dsv4_backend.py#L2007-L2074) 从预分配的 `out_swa_loc/out_c4_loc` 按 step 切片 | 每一步先切出本步 full loc，再翻译 SWA loc，并按 4-token 边界派生 C4 loc | KV 地址规则不变；C4 state loc 由本步 SWA loc 翻译，C128 state loc 由 request + position 计算 |
 | Target verify | [`maybe_build_dsv4_verify_bundle()`](dsv4_common_hooks.py#L376-L410) 从 SWA/C4/state request table 截取 draft 区间 | 使用 verify 阶段已有的 full loc 重新翻译 SWA loc、派生 C4 loc；C128/state 暂时保留原表 | KV 继续使用改动一规则；按 draft positions 构造二维 C4/C128 `state_loc` 表，并传 `start_pos=committed length`、`seqused=draft count` |
-| MTP metadata | 每个 step/replay 维护独立 C4 page table 以及 C4/SWA/state loc buffer | C4 page table 复用 full block table，C4/SWA loc 由本步 full loc 生成 | Graph 固定持有两张二维显式 loc tensor，replay 原地刷新；不保留长期 state request/page table |
-| Accepted/rejected | allocator snapshot 回滚 full、SWA、C4、C128 和 state | 删除 C4 allocator 快照；被拒绝的 C4/Indexer 数据由有效序列长度隔离，后续按同一 full page id 覆盖 | state 不做 allocator rollback；下一轮只从 `old_start_pos + accepted` 继续，被拒绝 suffix 在相同绝对位置覆盖 |
+| MTP metadata | 每个 step/replay 维护独立 C4 page table 以及 C4/SWA/state loc buffer | C4 page table 复用 full block table，C4/SWA loc 由本步 full loc 生成 | 复用 `fm.dsv4_explicit_state_block_tables` 的 ratio=4/128 固定 tensor，replay 原地刷新；不新增命名字段，Graph/MTP 不再读取 state request/page table |
+| Accepted/rejected | allocator snapshot 回滚 full、SWA、C4、C128 和 state | 删除 C4 allocator 快照；被拒绝的 C4/Indexer 数据由有效序列长度隔离，后续按同一 full page id 覆盖 | 直接复用 runtime 更新后的 committed `seq_lens`；NPU 不提交或回滚 state，下一轮 helper 在相同绝对位置覆盖 rejected suffix |
 
-MTP 的正确性依赖 runtime 只推进 accepted token 数，并为下一轮重新构造显式地址：C4A/C4Li 从对应 full/SWA loc 翻译，C128A 使用 `req_pool_idx` 和绝对位置取模。新版算子只按二维表中的 `state_loc` 读写，不再自行计算 ring offset。ring size 必须包含最大 verify 宽度的 guard 空间，避免同一轮 draft 覆盖仍需读取的 committed state；满足该容量约束后，被拒绝 suffix 无需 allocator rollback，下一轮会在重新计算出的相同位置覆盖。
+MTP 的正确性依赖现有 runtime 只推进 accepted token 数；NPU 下一轮读取这个 committed `seq_lens`，再由公共 helper 重建显式地址：C4A/C4Li 从对应 full/SWA loc 翻译，C128A 使用 `req_pool_idx` 和绝对位置取模。新版算子只按二维表中的 `state_loc` 读写，不再自行计算 ring offset。speculative ring size 直接复用公共 `get_compress_state_ring_size()`，其 guard 空间覆盖最大 verify 宽度；因此 rejected suffix 无需 NPU allocator rollback，会在下一轮相同绝对位置自然覆盖。
 
 改动一还需要保证：draft 地址预留、逐 step draft 和 target verify 使用相同的 request 顺序与 4-token 边界规则，使派生的 C4 loc 始终与 compressor 输出顺序一致。
 
