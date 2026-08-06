@@ -7,7 +7,24 @@
 1. **复用 full 地址映射**：C4 和 Indexer 的 page size 从 128 改为 32，共同复用 full page id 和 block table；SWA 复用现有 `full_to_swa_index_mapping`。删除 C4 独立 allocator、`req_to_token_c4` 和 `req_to_token_swa`。
 2. **NPU fused compressor 支持 ring**，C4/C128 及 Indexer 的 compressor state 改为固定 ring buffer，不再需要 state allocator 和两张 state request table。
 
+改动二按四个可独立 review 的子改动实施：前三项在建立 ring storage、Eager、Graph/MTP 新路径时同步删除各自替代的 paged state 逻辑，第四项完成 PD ring bank 传输。删除不是单独阶段。
+
 > 当前代码索引：[六类 allocator](dsv4_allocator.py#L122-L188) · [五张辅助 request table](dsv4_req_to_token_pool.py#L43-L101) · [GPU C4 native page 布局](../../../mem_cache/deepseek_v4_memory_pool.py#L562-L645) · [GPU C4 地址派生](../../../../kernels/ops/attention/dsv4/metadata_kernel.py#L34-L50)
+
+### SVG 矢量图索引
+
+以下文件可单独打开并无限放大，原始 Mermaid 图仍保留在正文中：
+
+- C4 地址链路：[重构前](npu_dsv4_cache_refactor_svgs/01-c4-address-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/02-c4-address-after.svg)
+- Indexer 链路：[重构前](npu_dsv4_cache_refactor_svgs/03-indexer-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/04-indexer-after.svg)
+- SWA request table：[重构前](npu_dsv4_cache_refactor_svgs/05-swa-table-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/06-swa-table-after.svg)
+- Compressor state：[重构前](npu_dsv4_cache_refactor_svgs/07-compressor-state-before.svg) · [Ring 重构后](npu_dsv4_cache_refactor_svgs/08-compressor-state-ring-after.svg)
+- 改动二实施拆分：[四个子改动](npu_dsv4_cache_refactor_svgs/11-compressor-ring-four-parts.svg)
+- 子改动 1 · Ring pool：[重构前](npu_dsv4_cache_refactor_svgs/12-p1-ring-pool-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/13-p1-ring-pool-after.svg)
+- 子改动 2 · Eager Compressor：[重构前](npu_dsv4_cache_refactor_svgs/14-p2-eager-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/15-p2-eager-after.svg)
+- 子改动 3 · Graph/MTP：[重构前](npu_dsv4_cache_refactor_svgs/16-p3-graph-mtp-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/17-p3-graph-mtp-after.svg)
+- 子改动 4 · PD ring bank：[重构前](npu_dsv4_cache_refactor_svgs/18-p4-pd-ring-before.svg) · [重构后](npu_dsv4_cache_refactor_svgs/19-p4-pd-ring-after.svg)
+- PD 地址与传输链路：[改动一前](npu_dsv4_cache_refactor_svgs/09-pd-before-change-one.svg) · [改动一后](npu_dsv4_cache_refactor_svgs/10-pd-after-change-one.svg)
 
 
 ## 2. 改动一：复用 full 地址映射
@@ -321,60 +338,195 @@ flowchart LR
 
 > 当前代码索引：[full→SWA 映射创建与注册](../../../mem_cache/allocator/swa.py#L78-L101) · [alloc 更新映射](../../../mem_cache/allocator/swa.py#L274-L315) · [SWA 回收清理映射](../../../mem_cache/allocator/swa.py#L333-L359) · [GPU DSV4 使用映射](../../../layers/attention/deepseek_v4_backend.py#L1124-L1126) · [NPU 通用路径构造 SWA block table](../attention/ascend_backend.py#L438-L462)
 
-## 3. 改动二：compressor state 改为 ring
+## 3. 改动二：Compressor state 全量切换为 request-scoped ring
 
-当前 NPU fused compressor 使用 paged state，因此 runtime 需要为 state 单独分配、记录和回收 page。但 compressor 真正需要的只是一段固定长度的近期状态，适合改为循环覆盖的 ring buffer。
+改动二的最终目标不是同时维护 paged/ring 两条路径，而是用 Atlas A3 `cache_mode=2` 的 Compressor 完整替代当前 `cache_mode=1`：三类 state 都使用固定 request bank，不再进入 token/page allocator。
 
-目标修改：
+### 3.1 统一地址模型
 
-- C4 attention state 和 C4 Indexer state 保留两组独立 tensor，但都改为以 SWA physical page 为 bank 的 ring。
-- C128 state 改为以 request slot 为 bank 的 ring。
-- 删除 C4/C128 state allocator、`req_to_token_c4_state` 和 `req_to_token_c128_state`。
-- 删除为 paged state 服务的 state length、watermark 回收和 allocator rollback 管理。
-- state physical tensor 仍然保留，只是从“按序列增长的 page”改为“固定大小的 ring”。
+C4 Attention、C4 Indexer 和 C128 使用三类形状不同的 per-layer state pool；每个相关 layer 都有自己的 pool 对象，但地址规则完全一致：
 
-这项修改依赖 NPU fused compressor 提供完整 ring 语义，包括稳定 bank 选择、跨 chunk 状态接续以及有效长度、写入位置管理。
+```text
+bank_id     = req_pool_idx
+ring_offset = absolute_position % ring_size
+flat_loc    = bank_id * ring_size + ring_offset
+```
 
-代码框架对比：
+SGLang 只向算子传 `state_block_table[b] = req_pool_idx[b]`；`ring_offset` 由算子根据 `start_pos` 和本轮 token offset 计算。当前 request pool 已保留 slot 0 作为 graph padding/dummy，活动请求使用 slot 1..N，因此 bank 0 可直接作为 dummy bank。
 
-这条链路只有一个业务入口：一个 `ScheduleBatch` 开始执行本轮 DSV4 forward。内部依次经过两个阶段：
+| State | 物理 pool | `state_cache` shape | bank | ring offset |
+| --- | --- | --- | --- | --- |
+| C4 Attention | C4A ring pool | `[req_slots, ring4, 2048]` | `req_pool_idx` | `position % ring4` |
+| C4 Indexer | C4Li ring pool | `[req_slots, ring4, 512]` | `req_pool_idx` | `position % ring4` |
+| C128 Attention | C128A ring pool | `[req_slots, ring128, 1024]` | `req_pool_idx` | `position % ring128` |
 
-- **地址准备阶段**：Prefill 走 `ScheduleBatch.prepare_for_extend()`，Decode 走 `ScheduleBatch.prepare_for_decode()`；二者只会选择一个，再分别调用 allocator 的 `alloc_extend()` 或 `alloc_decode()`。
-- **模型计算阶段**：`MQALayer.forward()` 进入 Attention compressor 和 Indexer compressor；二者最终复用 backend 的 `forward_compress()`。
-- **最终结果**：本轮得到 compressed KV，同时保存下一轮能够继续计算的 state。
+C4 Attention 与 C4 Indexer 的 bank/offset 数值相同，但二者保存的数据和 last dim 不同，必须保留两个独立 tensor。三类 state 均不再依赖 SWA physical page，也不复用 GPU C4 的 SWA→state 地址转换。
 
 颜色说明：蓝色表示复用，绿色表示新增，橙色表示修改，红色表示删除；灰色是业务输入，紫色是最终结果。
 
-重构前，state 和 KV 一样采用 paged 地址管理；allocator 先分配 state slot 并写入 request table，backend 再从 table 构造 `state_block_table`：
+重构前，state 地址沿着“分配→写 loc→写 request table→构造 page table”的链路流动：
 
 ```mermaid
 flowchart LR
-    Entry["业务入口：一个 batch 执行 DSV4 forward<br/>ScheduleBatch"]:::neutral
-    Prefill["[复用] Prefill 地址准备<br/>ScheduleBatch.prepare_for_extend()"]:::reused
-    Decode["[复用] Decode 地址准备<br/>ScheduleBatch.prepare_for_decode()"]:::reused
-    AllocEntry["地址准备阶段<br/>DSV4NPUTokenToKVPoolAllocator.alloc_extend() / alloc_decode()"]:::neutral
-    StateLens["[删除] 计算 paged state 分配长度<br/>DSV4NPUTokenToKVPoolAllocator.compute_dsv4_state_lens_extend() / decode()"]:::deleted
-    StateAlloc["[删除] 独立分配 state slot<br/>DSV4NPUTokenToKVPoolAllocator._alloc_state_extend()"]:::deleted
-    StateLoc["[删除] 本轮 state 写地址<br/>DSV4OutCacheLoc.out_c4_state_loc / out_c128_state_loc"]:::deleted
-    WriteTable["[删除] 记录 state 地址<br/>DSV4ReqToTokenTablesMixin.write_c4_state() / write_c128_state()"]:::deleted
-    StateTable["[删除] 保存完整 state 地址历史<br/>DSV4ReqToTokenTablesMixin.req_to_token_c4_state / req_to_token_c128_state"]:::deleted
-    BuildTable["[删除] 构造 state_block_table<br/>CompressorAscendBackendMixin._compute_compress_locs()"]:::deleted
-    StatePool["[删除] paged state tensor<br/>NPUCompressStatePool"]:::deleted
-    ModelForward["[复用] 模型计算阶段<br/>MQALayer.forward()"]:::reused
-    CoreCompressor["[复用] Attention compressor<br/>CompressorAscendBackendMixin.forward_core_compressor()"]:::reused
-    IndexerCompressor["[复用] Indexer compressor<br/>CompressorBackendMixin.forward_indexer_compressor()"]:::reused
-    ForwardCompress["[修改] 共享 fused compressor 实现<br/>CompressorAscendBackendMixin.forward_compress()<br/>两条路径分别调用，state cache_mode=1"]:::changed
-    Result["最终：Core 调用写入 C4/C128 KV，Indexer 调用写入 K/scale<br/>并分别更新 Attention / Indexer state"]:::result
+    Batch["ScheduleBatch<br/>Prefill / Decode / Verify"]:::neutral
+    Lens["[删除] DSV4StateLens<br/>state alloc len / offset"]:::deleted
+    Alloc["[删除] C4/C128 state allocator<br/>按 token/page 分配与回收"]:::deleted
+    OutLoc["[删除] out_c4_state_loc<br/>out_c128_state_loc"]:::deleted
+    Tables["[删除] req_to_token_c4_state<br/>req_to_token_c128_state"]:::deleted
+    PageTable["[删除] c4/c128_state_page_table<br/>INT32[B, max_pages]"]:::deleted
+    PagedPool["[修改] NPUCompressStatePool<br/>当前为 paged FP32 layout"]:::changed
+    Op["[修改] custom.compressor<br/>cache_mode=1"]:::changed
+    Result["本轮 compressed KV<br/>并更新 paged state"]:::result
 
-    Entry --> Prefill --> AllocEntry
-    Entry --> Decode --> AllocEntry
-    AllocEntry --> StateLens --> StateAlloc --> StateLoc --> WriteTable --> StateTable --> BuildTable
-    BuildTable --> ModelForward
-    ModelForward --> CoreCompressor
-    ModelForward --> IndexerCompressor
-    CoreCompressor -->|独立调用| ForwardCompress
-    IndexerCompressor -->|独立调用| ForwardCompress
-    StatePool --> ForwardCompress --> Result
+    Batch --> Lens --> Alloc --> OutLoc --> Tables --> PageTable --> Op --> Result
+    PagedPool --> Op
+
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+重构后，request slot 本身就是 state bank，不再存在 state 地址分配链：
+
+```mermaid
+flowchart LR
+    Batch["ScheduleBatch<br/>Prefill / Decode / Verify"]:::neutral
+    Req["[复用] req_pool_indices<br/>活动请求 1..N，0=dummy"]:::reused
+    Seq["[复用] start_pos / seqused<br/>cu_seqlens"]:::reused
+    Bank["[派生] compress_state_bank<br/>req_pool_indices INT64 → INT32<br/>bank=req_pool_idx"]:::changed
+
+    subgraph Pools["[修改] NPUCompressStatePool 的三类 per-layer ring 实例"]
+        direction TB
+        C4A["C4A state<br/>[req_slots, ring4, 2048]"]:::changed
+        C4Li["C4Li state<br/>[req_slots, ring4, 512]"]:::changed
+        C128A["C128A state<br/>[req_slots, ring128, 1024]"]:::changed
+    end
+
+    Op["[修改] custom.compressor<br/>state_block_table=compress_state_bank<br/>cache_mode=2"]:::changed
+    Epilog["[复用] _compressor_epilog_npu()<br/>写 C4/C128 KV 或 Indexer K/scale"]:::reused
+    Result["本轮 compressed KV<br/>并按绝对位置更新 ring state"]:::result
+
+    Batch --> Req --> Bank
+    Batch --> Seq
+    Bank --> Op
+    Seq --> Op
+    C4A --> Op
+    C4Li --> Op
+    C128A --> Op
+    Op --> Epilog --> Result
+
+    classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+    style Pools fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
+```
+
+### 3.2 四个可独立 review 的子改动
+
+四个子改动按 storage ownership、Eager、Graph/MTP、PD 四个责任边界拆分。每个子改动同时加入 ring 逻辑并删除被它替代的 paged 逻辑；不再设置“删除 allocator”和“删除 table”两个独立清理阶段。前三项合起来完成单机切换，第四项完成跨实例传输。
+
+```mermaid
+flowchart LR
+    P1["子改动 1<br/>Ring storage ownership<br/>+ 删除 paged allocation"]:::changed
+    P2["子改动 2<br/>Eager cache_mode=2<br/>+ 删除 Eager paged metadata"]:::changed
+    P3["子改动 3<br/>Graph/MTP ring<br/>+ 删除剩余 state metadata"]:::changed
+    P4["子改动 4<br/>PD ring bank 传输"]:::changed
+    Final["最终：单机与 PD<br/>Compressor state 仅使用 ring"]:::result
+
+    P1 --> P2 --> P3 --> P4 --> Final
+
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+#### 3.2.1 子改动 1：Ring storage ownership 与 paged allocation 删除
+
+- 在 `dsv4_memory_pool.py` 原地重构现有 `NPUCompressStatePool`。保留类名、现有 factory、layer mapping 以及 `get_state_cache()` 调用边界，只把内部 storage 改为 `[req_slots, ring_size, 2 * coff * head_dim]` 连续 FP32 layout。
+- 沿用现有 `compress_state_pools` 与 `indexer_compress_state_pools` 的 per-layer 实例和 layer mapping；C4A、C4Li、C128A 是三种实例类型而非全模型三个对象，只改变各实例内部 layout。`req_slots` 使用实际 request table 行数，覆盖普通模式和 decode 预分配 slot。
+- 不新增第二个 `RingCompressorStatePool`/`NPURingCompressStatePool` 类型，避免 factory、访问接口和生命周期形成双轨抽象。
+- 新 request 第一次取得 `req_pool_idx` 时清对应 bank：KV 置 0、score 置 `-inf`；chunked prefill、decode 和 verify 复用同一 request slot 时不清。
+- 同步删除 `npu_state_pool_size()`、paged page view、page-0 sentinel 和 KV cache configurator 中的 paged-state sizing override。
+- 同步删除 `c4_state_attn_allocator/c128_state_attn_allocator`、`DSV4StateLens`、`out_c4_state_loc/out_c128_state_loc` 及其 alloc/free/clear/evict 分支；`DSV4OutCacheLoc` 只承载 KV 地址。
+- 增加 shape/dtype/contiguous、单 bank 清理、slot 复用、dummy bank，以及 allocator/bundle 不再包含 state 的单测。本子改动只负责 storage ownership；Compressor consumer 的 Eager 和 Graph 切换分别属于子改动 2、3。
+
+本子改动的输入是实际 request slot 容量和三种 Compressor shape，结果是 state ownership 从 token/page allocator 一次性迁移到 request bank；旧 state allocator、lens、loc 和 paged sizing 在同一个子改动中删除。
+
+重构前，pool 大小和物理页由 paged state allocator 模型决定：
+
+```mermaid
+flowchart LR
+    Config["输入：max_running_requests<br/>page_size / ratio"]:::neutral
+    Sizing["[删除] npu_state_pool_size()<br/>计算 paged slot 数"]:::deleted
+    Pool["[修改] NPUCompressStatePool<br/>当前 [blocks, page_size, last_dim]"]:::changed
+    Sentinel["[删除] page 0 skip sentinel"]:::deleted
+    Alloc["[删除] state allocator / DSV4StateLens<br/>state loc / alloc/free/evict"]:::deleted
+    Result["结果：state storage<br/>依赖分页分配生命周期"]:::result
+
+    Config --> Sizing --> Pool --> Sentinel --> Result
+    Alloc --> Pool
+
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+重构后，request slot 容量直接决定 bank 数，三类 per-layer pool 实例共享同一个 bank 编号规则；allocator bundle 只保留 KV 地址：
+
+```mermaid
+flowchart LR
+    Capacity["输入：req_to_token.shape[0]<br/>包含 slot 0 dummy"]:::neutral
+    Factory["[修改] NPUCompressStatePool<br/>同一类改为连续 request ring tensor"]:::changed
+    C4A["[修改] per-layer C4A pools<br/>[req_slots, ring4, 2048]"]:::changed
+    C4Li["[修改] per-layer C4Li pools<br/>[req_slots, ring4, 512]"]:::changed
+    C128A["[修改] per-layer C128A pools<br/>[req_slots, ring128, 1024]"]:::changed
+    ReqAlloc["[修改] request slot 首次分配/复用<br/>clear_bank(req_pool_idx)"]:::changed
+    KVBundle["[修改] DSV4OutCacheLoc<br/>只包含 KV loc，无 state loc"]:::changed
+    Result["结果：per-layer request ring<br/>无 state allocator/lens/loc/sizing"]:::result
+
+    Capacity --> Factory
+    Factory --> C4A --> Result
+    Factory --> C4Li --> Result
+    Factory --> C128A --> Result
+    ReqAlloc --> C4A
+    ReqAlloc --> C4Li
+    ReqAlloc --> C128A
+    KVBundle --> Result
+
+    classDef added fill:#E8F7EE,stroke:#22A06B,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+#### 3.2.2 子改动 2：Eager ring 切换与 Eager paged metadata 删除
+
+- `forward_compress()` 固定传 `cache_mode=2`；复用已有 `get_state_cache(layer_id, is_in_indexer)` 路由取得当前层的 C4A、C4Li 或 C128A pool，不新增选择函数。
+- 在每个 Eager batch 构造 metadata 时，只派生一次 `compress_state_bank = req_pool_indices.to(torch.int32)`，供所有 Compressor 层作为 `state_block_table` 复用。它不是函数、长期 table 或新 ownership。
+- 同步删除 Eager 路径的 state loc 写表 hook、`c4_state_page_table/c128_state_page_table` 构造与消费；prefill 显式设置 `seqused=cu_seqlens[1:]-cu_seqlens[:-1]`。
+- 保留 RoPE、Hadamard、输出长度检查和 `_compressor_epilog_npu()`，避免把 state 重构扩散到 compressed KV 写入链路。
+- 覆盖 C4A/C4Li/C128A 的 eager prefill、decode、空 batch、非恒等 bank 映射，以及每个 batch 只做一次 INT64→INT32 bank 转换。
+
+本子改动的输入是 Eager batch 的 request/sequence metadata 和子改动 1 改造后的 ring pool，结果是 Eager 计算统一切到 `cache_mode=2`，同时不再产生、写入或消费任何 Eager paged-state metadata。
+
+重构前，backend 从两张 state request table 构造二维 page table：
+
+```mermaid
+flowchart LR
+    Batch["输入：eager ForwardBatch<br/>req / seq / cu_seqlens"]:::neutral
+    Tables["[删除 Eager 依赖] state 写表/查表 hook<br/>读取两张 state request table"]:::deleted
+    Build["[删除] _compute_compress_locs()<br/>构造 state page ids"]:::deleted
+    Metadata["[删除] c4/c128_state_page_table<br/>INT32[B, max_pages]"]:::deleted
+    Pool["[删除] paged state_cache"]:::deleted
+    Op["[修改] custom.compressor<br/>cache_mode=1"]:::changed
+    Epilog["[复用] _compressor_epilog_npu()"]:::reused
+    Result["结果：compressed KV<br/>写回 paged state"]:::result
+
+    Batch --> Build
+    Tables --> Build --> Metadata --> Op
+    Pool --> Op --> Epilog --> Result
 
     classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
     classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
@@ -383,62 +535,161 @@ flowchart LR
     classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
 ```
 
-重构后不再预分配 state 地址。backend 先进入 ring metadata 构造流程，在构造过程中根据 SWA loc 或 request/position 计算 ring bank 和位置；完整 metadata 准备好后，再进入模型计算并调用 ring 模式 fused compressor：
+重构后，只构造一维 request bank；同一个 bank tensor 配合不同 state pool 分别完成 C4A、C4Li、C128A 调用：
 
 ```mermaid
 flowchart LR
-    Entry["业务入口：一个 batch 执行 DSV4 forward<br/>ScheduleBatch"]:::neutral
-    Prefill["[复用] Prefill 地址准备<br/>ScheduleBatch.prepare_for_extend()"]:::reused
-    Decode["[复用] Decode 地址准备<br/>ScheduleBatch.prepare_for_decode()"]:::reused
-    AllocEntry["地址准备阶段<br/>DSV4NPUTokenToKVPoolAllocator.alloc_extend() / alloc_decode()"]:::neutral
-    KVOnly["[修改] 删除 state 分配，仅返回或派生 KV 写地址<br/>DSV4NPUTokenToKVPoolAllocator._alloc_c_and_state()"]:::changed
-    SWAInput["[复用] C4/Indexer bank 输入<br/>本轮 SWA loc"]:::reused
-    ReqInput["[复用] C128 bank 输入<br/>req_pool_indices + positions"]:::reused
-    subgraph MetadataBuild["[修改] NPU metadata 改为 ring<br/>CompressorAscendBackendMixin._build_npu_compress_metadata()"]
-        direction TB
-        MetadataInput["接收本轮地址与序列信息"]:::neutral
-        C4StateLoc["[复用] 计算 C4/Indexer ring 位置<br/>CompressStatePool.translate_from_swa_loc_to_state_loc()"]:::reused
-        C128StateLoc["[复用] 计算 C128 ring 位置<br/>CompressStatePool.translate_from_req_position_to_state_loc()"]:::reused
-        RingMetadata["[新增] NPU ring metadata<br/>ring write loc / 序列信息 / NPU 算子参数"]:::added
+    Batch["输入：eager ForwardBatch<br/>req_pool_indices / cu_seqlens"]:::neutral
+    Seq["[修改] start_pos / seqused<br/>prefill 也显式给有效长度"]:::changed
+    Bank["[派生] compress_state_bank<br/>req_pool_indices INT64 → INT32<br/>每个 batch 一次"]:::changed
+    Select["[复用] get_state_cache()<br/>layer_id / is_in_indexer 路由"]:::reused
+    Cleanup["[删除] Eager state loc 写表 hook<br/>c4/c128_state_page_table"]:::deleted
+    Op["[修改] custom.compressor<br/>state_block_table=bank<br/>cache_mode=2"]:::changed
+    Epilog["[复用] RoPE / Hadamard / length check<br/>_compressor_epilog_npu()"]:::reused
+    Result["结果：compressed KV<br/>并更新对应 request ring bank"]:::result
 
-        MetadataInput --> C4StateLoc --> RingMetadata
-        MetadataInput --> C128StateLoc --> RingMetadata
-    end
-    ModelForward["[复用] 模型计算阶段<br/>MQALayer.forward()"]:::reused
-    CoreCompressor["[复用] Attention compressor<br/>CompressorAscendBackendMixin.forward_core_compressor()"]:::reused
-    IndexerCompressor["[复用] Indexer compressor<br/>CompressorBackendMixin.forward_indexer_compressor()"]:::reused
-    RingPool["[复用] 基类创建 ring state pool<br/>DeepSeekV4TokenToKVPool._make_attn_state_pool() / _make_indexer_state_pool()<br/>返回 CompressStatePool"]:::reused
-    ForwardCompress["[修改] NPU fused compressor 实现<br/>CompressorAscendBackendMixin.forward_compress()<br/>两条路径分别调用，state cache_mode=2"]:::changed
-    Result["最终：Core 调用写入 C4/C128 KV，Indexer 调用写入 K/scale<br/>并分别更新 Attention / Indexer ring state"]:::result
+    Batch --> Seq --> Op
+    Batch --> Bank --> Op
+    Select --> Op --> Epilog --> Result
+    Cleanup --> Result
 
-    Entry --> Prefill --> AllocEntry
-    Entry --> Decode --> AllocEntry
-    AllocEntry --> KVOnly --> MetadataInput
-    SWAInput --> C4StateLoc
-    ReqInput --> C128StateLoc
-    RingMetadata --> ModelForward
-    RingMetadata --> ForwardCompress
-    ModelForward --> CoreCompressor
-    ModelForward --> IndexerCompressor
-    CoreCompressor -->|独立调用| ForwardCompress
-    IndexerCompressor -->|独立调用| ForwardCompress
-    RingPool --> ForwardCompress --> Result
+    classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+#### 3.2.3 子改动 3：Graph/MTP ring 切换与剩余 paged metadata 删除
+
+- Graph capture 时分配固定地址的 `compress_state_bank`，replay 只原地 `copy_`；idle/padding 行统一写 bank 0，并同步清 `start_pos/seqused`。
+- target verify 使用 `start_pos=committed prefix length`、`seqused=draft token count`，同一 request 在 verify 和后续 decode 期间保持 bank 不变。
+- ring size 按最大单次 request token 宽度计算，至少覆盖最大 verify draft 宽度；rejected suffix 不做 state allocator rollback，下一轮从 committed 位置覆盖。
+- 同步删除 Graph 中固定的 `c4/c128_state_page_table`、`c4/c128_state_loc` 及其 refresh/copy 逻辑，并删除 MTP speculative state reserve/rollback/clear 分支。
+- Eager 与 Graph consumer 都移除后，同步删除 `req_to_token_c4_state/req_to_token_c128_state`、`write_c4_state()/write_c128_state()` 及剩余 state write/free hooks；这些删除不再单列子改动。
+- 覆盖 graph 两次动态 replay、真实/idle 混合 batch、不同 bank、accepted=0/1/中间值/全部接受，并断言单机代码中不存在 state request table/page table/loc consumer。
+
+本子改动有两路输入：graph replay 的固定 tensor 约束，以及 MTP 的 committed/accepted 长度；结果是 Graph/MTP 与 Eager 使用完全相同的 ring 地址语义，同时删除单机路径最后的 state request table、page table、loc 和 speculative allocator hook。
+
+重构前，graph 固定持有二维 page table/state loc，MTP 继续预留和回收 speculative state slot：
+
+```mermaid
+flowchart LR
+    Capture["输入一：Graph capture/replay"]:::neutral
+    PageBuf["[删除] 固定 c4/c128_state_page_table<br/>INT32[max_bs, max_pages]"]:::deleted
+    LocBuf["[删除] 固定 c4/c128_state_loc"]:::deleted
+    Verify["输入二：Target verify<br/>draft tokens"]:::neutral
+    Reserve["[删除] 预留 speculative state slot"]:::deleted
+    Rollback["[删除] rejected state allocator rollback/clear"]:::deleted
+    Tables["[删除] 两张 state request table<br/>剩余 write/free hooks"]:::deleted
+    Op["[修改] graph Compressor<br/>cache_mode=1"]:::changed
+    Result["结果：graph/MTP state<br/>绑定 paged allocation"]:::result
+
+    Capture --> PageBuf --> Op
+    Capture --> LocBuf --> Op
+    Verify --> Reserve --> Op
+    Reserve --> Rollback --> Result
+    Tables --> Result
+    Op --> Result
+
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+重构后，graph 只固定一维 bank tensor；MTP 通过绝对起点和 accepted 长度表达提交/覆盖：
+
+```mermaid
+flowchart LR
+    Capture["输入一：Graph capture<br/>max_graph_bs"]:::neutral
+    BankBuf["[新增] 固定 compress_state_bank<br/>INT32[max_graph_bs]"]:::added
+    Replay["[修改] replay 原地 copy_<br/>idle/padding bank=0"]:::changed
+    Verify["输入二：Target verify<br/>committed length + draft count"]:::neutral
+    Meta["[修改] start_pos=committed<br/>seqused=draft count"]:::changed
+    Op["[修改] graph Compressor<br/>cache_mode=2"]:::changed
+    Accept["[新增] 下一轮 start_pos<br/>只推进 accepted"]:::added
+    Overwrite["[新增] rejected suffix<br/>同一绝对位置覆盖"]:::added
+    Cleanup["[删除] Graph state page/loc buffer<br/>两张 state table 与剩余 hooks"]:::deleted
+    Result["结果：graph/MTP 与 eager 共享 ring<br/>单机无 paged state metadata"]:::result
+
+    Capture --> BankBuf --> Replay --> Op
+    Verify --> Meta --> Op --> Accept --> Overwrite --> Result
+    Cleanup --> Result
+
+    classDef added fill:#E8F7EE,stroke:#22A06B,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+#### 3.2.4 子改动 4：PD 分离切换为 ring bank 传输
+
+- `DSV4_C4_STATE` 和 `DSV4_C128_STATE` 继续作为两个 state component；C4 component 内包含 C4A 与 C4Li 多个 buffer，二者复用同一 bank index。
+- `get_pd_state_components()` 将 state `item_len` 从“一页 paged state”改成“一个完整 ring bank”；Prefill source 和 Decode destination 分别使用本地 `req_pool_idx` 计算 bank。
+- `dsv4_state_payloads()` 不再读取两张已删除的 state table，而是分别返回 source bank 和 destination bank；两侧 bank id 可以不同，但数量和顺序必须一一对应。
+- Ascend connector 对 SWA/C4/C128/Indexer KV 继续执行原有 exact index 约束；对两个 ring state component 改为允许 source/destination bank remap。
+- Prefill/Decode 必须使用相同的 C4/C128 ring size；接收前清 destination bank，传输后用 committed sequence length 继续计算，不需要恢复 state request table 或 cursor。
+- 覆盖 source bank≠destination bank、C4A/C4Li/C128A 全量 state 对比、传输后继续 decode、bank 释放复用及 PD+MTP。
+
+本子改动的输入是 Prefill/Decode 两侧已经一致的 ring layout，以及各自本地 request slot；结果是跨实例搬运完整 bank，而不是传输 state page list。
+
+重构前，PD state payload 仍依赖 paged request table，并要求源/目标 page index 精确相同：
+
+```mermaid
+flowchart LR
+    Prefill["输入：Prefill request<br/>req_pool_idx / seq_len"]:::neutral
+    SrcTable["[删除] source state request table"]:::deleted
+    SrcPages["[删除] dsv4_state_payloads()<br/>构造 source state page ids"]:::deleted
+    Decode["输入：Decode 预分配"]:::neutral
+    DstAlloc["[删除] destination state allocator/table"]:::deleted
+    Exact["[修改] Ascend connector<br/>要求 src page ids == dst page ids"]:::changed
+    Transfer["[删除] item_len=one state page<br/>按页搬运"]:::deleted
+    Result["结果：PD state 传输<br/>绑定分页地址体系"]:::result
+
+    Prefill --> SrcTable --> SrcPages --> Exact
+    Decode --> DstAlloc --> Exact --> Transfer --> Result
+
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+```
+
+重构后，源/目标各自计算本地 bank，connector 按 component 将一个完整 source bank 搬到对应 destination bank：
+
+```mermaid
+flowchart LR
+    Prefill["输入一：Prefill req_pool_idx<br/>source bank"]:::neutral
+    Decode["输入二：Decode req_pool_idx<br/>destination bank"]:::neutral
+    Register["[修改] get_pd_state_components()<br/>item_len=one full ring bank"]:::changed
+    Components["[复用] DSV4_C4_STATE<br/>DSV4_C128_STATE"]:::reused
+    Remap["[新增] Ascend ring-state dispatch<br/>允许 src bank != dst bank"]:::added
+    Clear["[新增] 接收前 clear destination bank"]:::added
+    Transfer["[修改] C4A/C4Li/C128A<br/>按 component 搬运完整 bank"]:::changed
+    Resume["[复用] committed seq_len<br/>继续 cache_mode=2 decode"]:::reused
+    Result["结果：PD 两侧 state 一致<br/>无 state table 或 page list"]:::result
+
+    Prefill --> Remap
+    Decode --> Clear --> Remap
+    Register --> Components --> Remap --> Transfer --> Resume --> Result
 
     classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
     classDef added fill:#E8F7EE,stroke:#22A06B,color:#0F172A,stroke-width:1.5px;
     classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
     classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
     classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
-    style MetadataBuild fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
 ```
 
-GPU [`create_paged_compressor_data()`](../../../layers/attention/dsv4/compressor_v2.py#L403-L475) 的名称、实现和调用链保持不变。NPU 只修改现有 [`CompressorAscendBackendMixin._build_npu_compress_metadata()`](../attention/ascend_dsv4_backend.py#L97-L136)：将基于 state page table 的 metadata 改为 ring metadata，在该过程内部计算 C4/Indexer 和 C128 ring 位置，复用 [`CompressStatePool.translate_from_swa_loc_to_state_loc()`](../../../mem_cache/deepseek_v4_compress_state.py#L201-L207) 和 [`translate_from_req_position_to_state_loc()`](../../../mem_cache/deepseek_v4_compress_state.py#L209-L214)，再按照 NPU fused compressor 的 ring 接口构造 NPU 专用 metadata。GPU 与 NPU 不共用 metadata 类型。
+| 子改动 | 主要文件 | 行为切换 | 独立验收点 |
+| --- | --- | --- | --- |
+| 1. Ring storage ownership | `dsv4_memory_pool.py`、`dsv4_allocator.py`、`forward_batch_info.py`、`kv_cache_configurator.py` | 原地 ring 化；同步删除 paged sizing、state allocator/lens/loc | per-layer 三类 pool、清 bank、KV-only bundle、无 state alloc/free |
+| 2. Eager ring | `ascend_dsv4_backend.py`、Eager hooks | Eager 切 `cache_mode=2`；同步删除 Eager state 写表/page-table 链 | 三变体、bank 每 batch 仅派生一次、无 Eager paged metadata |
+| 3. Graph/MTP ring | `ascend_dsv4_backend.py`、`dsv4_req_to_token_pool.py`、`dsv4_common_hooks.py`、spec runtime | Graph/MTP 切 ring；同步删除剩余 state table/hooks/rollback | replay metadata、rejected overwrite、单机无 paged state metadata |
+| 4. PD ring | `dsv4_memory_pool.py`、`dsv4_common_hooks.py`、`disaggregation/ascend/conn.py` | 切换跨实例 state 传输 | source/destination bank 可重映射，传输后三类 state 一致 |
 
-图中的 Attention compressor 和 Indexer compressor 是两个调用方，不是共享 fused compressor 之前的两个串行算子。它们会分别调用同一个 `forward_compress()`：Core 调用使用 Attention state 并写入 C4/C128 KV，Indexer 调用使用独立 Indexer state 并写入 Indexer K/scale；`cache_mode=2` 只表示两次调用都采用 ring state。
-
-pool 层删除 [`NPUCompressStatePool`](dsv4_memory_pool.py#L121-L192) 以及 NPU 的 [`_make_attn_state_pool()` / `_make_indexer_state_pool()` override](dsv4_memory_pool.py#L324-L358)，[`DSV4NPUTokenToKVPool`](dsv4_memory_pool.py#L272-L393) 直接继承基类 factory，复用 `CompressStatePool` ring buffer 和地址转换；allocator/batch 层删除 state 分配参数、[`DSV4OutCacheLoc` 的 state loc 和 `DSV4StateLens`](../../../model_executor/forward_batch_info.py#L261-L322)；metadata 层不修改 GPU builder，NPU backend 修改现有 `_build_npu_compress_metadata()` 构造 ring metadata，并修改 [`forward_compress()`](../attention/ascend_dsv4_backend.py#L369-L430) 直接消费该 metadata。不新增 state allocator。
-
-> 当前代码索引：[NPU paged state pool](dsv4_memory_pool.py#L84-L192) · [state allocator 和 state length](dsv4_allocator.py#L221-L575) · [state table 写入与回收](dsv4_common_hooks.py#L242-L297) · [fused compressor 调用](../attention/ascend_dsv4_backend.py#L369-L430) · [GPU ring state 参考](../../../mem_cache/deepseek_v4_compress_state.py#L84-L214)
+> 当前代码索引：[NPU paged state pool](dsv4_memory_pool.py#L84-L192) · [state allocator 和 state length](dsv4_allocator.py#L221-L575) · [state table 写入与回收](dsv4_common_hooks.py#L242-L373) · [graph metadata](../attention/ascend_dsv4_backend.py#L1082-L1408) · [fused compressor 调用](../attention/ascend_dsv4_backend.py#L370-L430)
 
 ## 4. MTP 相关适配
 
@@ -460,11 +711,11 @@ MTP 的 draft、target verify 和 accepted/rejected 处理会同时使用 KV 写
 | DSV4 allocator 识别 | [`allocation.py`](../../../mem_cache/allocation.py#L198-L244) 通过 `hasattr(c4_attn_allocator)` 识别 DSV4 | 改为显式 DSV4 capability/type 标识，删除 C4 allocator 后仍能返回 DSV4 地址 bundle | 标识保留，bundle 不再包含 state loc |
 | Draft 地址预留 | [`alloc_paged_token_slots_reserve_extend()`](dsv4_allocator.py#L68-L118) 预留 full/SWA/C4/C128/state 并写各自 request table | 预留 full/SWA/C128 和 paged state；SWA/C4 不再写独立 request table，C4 loc 由 full loc 派生 | 只预留 full/SWA/C128 KV；ring state 使用固定空间，不参与 token allocator 预留 |
 | 多步地址获取 | [`_step_out_cache_loc_dsv4()`](../attention/ascend_dsv4_backend.py#L2007-L2074) 从预分配的 `out_swa_loc/out_c4_loc` 按 step 切片 | 每一步先切出本步 full loc，再翻译 SWA loc，并按 4-token 边界派生 C4 loc | KV 地址规则不变；state 由 request、position 和 ring bank 直接定位，不再切 state loc |
-| Target verify | [`maybe_build_dsv4_verify_bundle()`](dsv4_common_hooks.py#L376-L410) 从 SWA/C4/state request table 截取 draft 区间 | 使用 verify 阶段已有的 full loc 重新翻译 SWA loc、派生 C4 loc；C128/state 暂时保留原表 | KV 继续使用改动一的规则；state 改为 verify 区间对应的 ring metadata |
-| MTP metadata | 每个 step/replay 维护独立 C4 page table 以及 C4/SWA/state loc buffer | C4 page table 复用 full block table，C4/SWA loc 由本步 full loc 生成 | 删除 state loc/page table，改为 ring bank、position 和 valid length |
-| Accepted/rejected | allocator snapshot 回滚 full、SWA、C4、C128 和 state | 删除 C4 allocator 快照；被拒绝的 C4/Indexer 数据由有效序列长度隔离，后续按同一 full page id 覆盖 | 删除 state allocator 快照；ring 必须区分 committed 与 speculative 状态，只提交 accepted 部分并丢弃 rejected 部分 |
+| Target verify | [`maybe_build_dsv4_verify_bundle()`](dsv4_common_hooks.py#L376-L410) 从 SWA/C4/state request table 截取 draft 区间 | 使用 verify 阶段已有的 full loc 重新翻译 SWA loc、派生 C4 loc；C128/state 暂时保留原表 | KV 继续使用改动一规则；state 传 `bank=req_pool_idx`、`start_pos=committed length`、`seqused=draft count` |
+| MTP metadata | 每个 step/replay 维护独立 C4 page table 以及 C4/SWA/state loc buffer | C4 page table 复用 full block table，C4/SWA loc 由本步 full loc 生成 | 删除 state loc/page table，只保留共享 request bank、绝对起点和本轮有效长度 |
+| Accepted/rejected | allocator snapshot 回滚 full、SWA、C4、C128 和 state | 删除 C4 allocator 快照；被拒绝的 C4/Indexer 数据由有效序列长度隔离，后续按同一 full page id 覆盖 | state 不做 allocator rollback；下一轮只从 `old_start_pos + accepted` 继续，被拒绝 suffix 在相同绝对位置覆盖 |
 
-MTP 下的 ring 不能只依赖“回退写指针”：draft 写入可能在回绕时覆盖仍有效的 committed state。fused compressor 需要提供 speculative guard 区、受影响数据备份或等价的 commit/rollback 语义，runtime 再根据 accepted length 提交对应状态。
+MTP 的正确性依赖绝对位置而不是 ring 写指针回退：runtime 只推进 accepted token 数，算子按 `absolute_position % ring_size` 读写。ring size 必须包含最大 verify 宽度的 guard 空间，避免同一轮 draft 覆盖本轮仍需读取的 committed state；满足该容量约束后，被拒绝 suffix 无需显式清理或搬移。
 
 改动一还需要保证：draft 地址预留、逐 step draft 和 target verify 使用相同的 request 顺序与 4-token 边界规则，使派生的 C4 loc 始终与 compressor 输出顺序一致。
 
@@ -472,21 +723,184 @@ MTP 下的 ring 不能只依赖“回退写指针”：draft 写入可能在回�
 
 ## 5. PD 分离相关适配
 
-PD 分离传输的数据 buffer 不变，但两项改动会改变“从哪里得到待传输页”和“state 如何描述”。本方案先保留传输框架，只调整 DSV4 payload 的地址来源和 state 表达。
+PD 按两项改动分别收敛：改动一让 SWA/C4/Indexer 的 page id 回到 full 地址来源；改动二的子改动 4 再把 Compressor state 从“paged state page list”切成“source request bank → destination request bank”的完整 bank 传输。两部分都不改变 KV 与 state 物理 buffer 彼此独立的事实。
+
+### 5.1 改动一后的 PD 删除边界
+
+结论是：**需要删除的是 PD 中跟随旧地址所有权的分配、写表和读表分支，不是 C4、Indexer 或 SWA 的数据传输分支。** C4 KV、Indexer K/scale 和 SWA KV 的物理 buffer 仍然存在，因此对应的 `AscendStateType`、buffer 注册和传输请求都必须保留。
+
+这里先统一数量口径：按本方案第 2 节的定义，改动一删除的是 **1 个 C4 allocator 和 2 张辅助 request table**（`req_to_token_c4`、`req_to_token_swa`）。Indexer 一直保留独立 pool，但与 C4 共用 `out_c4_loc`，没有第二个独立 Indexer allocator。如果把 C4 KV 和 Indexer 两个 pool 都称为“两个地址消费者”，它们确实同时失去独立地址所有权，但 runtime 中实际删除的 allocator 只有 C4 allocator。
+
+PD 代码按以下边界处理：
+
+| 代码/职责 | 改动一后的处理 | 原因 |
+| --- | --- | --- |
+| C4 allocator 的 PD 预留、free、clear/rollback 分支 | 删除 | C4 loc/page id 由 full 地址派生，不再拥有独立生命周期 |
+| `write_swa()`、`write_c4()` 及 `_write_dsv4_tables()` 中对应写表分支 | 删除 | `req_to_token_swa`、`req_to_token_c4` 已删除，继续写入会形成第二份地址真相 |
+| `dsv4_state_payloads()` 中读取两张旧表的分支 | 替换 | SWA 改为 base `req_to_token` + full→SWA mapping；C4/Indexer 改为 base `req_to_token` 的 full page id |
+| C4 和 Indexer page-list 构造 | 合并为同一个 full-page builder/缓存结果 | 两者使用相同 page id；仍以两个 StateType 传输不同 buffer |
+| `dsv4_prealloc_kwargs()`、`dsv4_unwrap_prealloc()`、`write_dsv4_prealloc_tables()` | 保留，但只服务 C128 和 paged state | 改动一后 C128 allocator 和两类 state allocator/table 仍存在；删除整个 wrapper 会导致 decode 侧没有目标页 |
+| `get_pd_state_components()` 中 SWA/C4/Indexer/C128/state buffer 注册 | 保留 | 地址收敛不等于数据 buffer 合并；C4 与 Indexer 仍需分别传输 |
+| `AscendStateType`、`_DSV4_KVCACHE_STATE_TYPES` 和 Ascend generic page dispatch | 保留 | connector 的 StateType 标识物理 buffer component，不标识 allocator/request table |
+| `req_to_token_c128` 和两张 state table 的 page-list 构造 | 保留 | 它们要到改动二或后续方案才发生变化 |
+
+当前实现已经完成了表格中的主要删除和替换；进一步适合做的是把 C4/Indexer 两次相同的 full page D2H 构造收敛成一次，并把 `hasattr(c128_attn_allocator)` 这类临时识别改成显式 DSV4 capability，避免能力判断继续绑定某个未来可能变化的子 allocator。
+
+改动一前，PD 预分配和 payload 都跟随各自的独立地址表：
+
+```mermaid
+flowchart LR
+    Entry["业务入口：为同一 request 构造 PD 源页/目标页<br/>Prefill sender + Decode receiver"]:::neutral
+
+    subgraph PreallocBefore["Decode 侧预分配"]
+        direction TB
+        Prealloc["[复用] alloc_for_decode_prealloc()<br/>进入 DSV4 预分配"]:::reused
+        ParentAlloc["[复用] full + SWA allocator<br/>生成 out_full_loc / out_swa_loc"]:::reused
+        C4Alloc["[删除] C4 独立 allocator<br/>生成 out_c4_loc"]:::deleted
+        OtherAlloc["[复用] C128 + paged state allocator"]:::reused
+        OldWrite["[删除] _write_dsv4_tables() 中<br/>SWA/C4 独立写表分支"]:::deleted
+
+        Prealloc --> ParentAlloc
+        Prealloc --> C4Alloc
+        Prealloc --> OtherAlloc
+        ParentAlloc --> OldWrite
+        C4Alloc --> OldWrite
+    end
+
+    subgraph PayloadBefore["Prefill/Decode 两侧 page-list 构造"]
+        direction TB
+        SWATable["[删除] req_to_token_swa"]:::deleted
+        C4Table["[删除] req_to_token_c4"]:::deleted
+        OtherTables["[复用] req_to_token_c128<br/>两张 state request table"]:::reused
+        SWAPages["SWA page ids"]:::neutral
+        C4Pages["C4 page ids + Indexer page ids"]:::neutral
+        OtherPages["C128/state page ids"]:::neutral
+
+        SWATable --> SWAPages
+        C4Table --> C4Pages
+        OtherTables --> OtherPages
+    end
+
+    Buffers["[复用] get_pd_state_components()<br/>注册各自独立数据 buffer"]:::reused
+    Transfer["结果：按 StateType 传输 SWA/C4/Indexer/C128/state"]:::result
+
+    Entry --> Prealloc
+    OldWrite --> SWATable
+    OldWrite --> C4Table
+    OtherAlloc --> OtherTables
+    SWAPages --> Transfer
+    C4Pages --> Transfer
+    OtherPages --> Transfer
+    Buffers --> Transfer
+
+    classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+    style PreallocBefore fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
+    style PayloadBefore fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
+```
+
+改动一后，PD 保留相同传输框架，但 page id 收敛为三种来源：full、full→SWA mapping、剩余 C128/state table。
+
+```mermaid
+flowchart LR
+    Entry["业务入口：为同一 request 构造 PD 源页/目标页<br/>Prefill sender + Decode receiver"]:::neutral
+
+    subgraph PreallocAfter["Decode 侧预分配"]
+        direction TB
+        Prealloc["[复用] alloc_for_decode_prealloc()<br/>进入 DSV4 预分配"]:::reused
+        ParentAlloc["[复用] full + SWA allocator<br/>SWA allocator 仍保留"]:::reused
+        OtherAlloc["[复用] C128 + paged state allocator"]:::reused
+        BaseTable["[复用] 通用路径维护 base req_to_token<br/>只记录 full loc"]:::reused
+        RemainingWrite["[修改] dsv4_unwrap_prealloc()<br/>只写 C128/state table"]:::changed
+        Removed["[删除] C4 allocator<br/>SWA/C4 独立写表分支"]:::deleted
+
+        Prealloc --> ParentAlloc --> BaseTable
+        Prealloc --> OtherAlloc --> RemainingWrite
+        Prealloc --> Removed
+    end
+
+    subgraph PayloadAfter["Prefill/Decode 两侧 page-list 构造"]
+        direction TB
+        FullPages["[新增] 一次构造 full physical page ids<br/>来自 base req_to_token"]:::added
+        C4Pages["[复用] C4 page ids"]:::reused
+        IndexPages["[复用] Indexer page ids<br/>与 C4 使用同一组 id"]:::reused
+        Translate["[复用] translate_loc_from_full_to_swa()<br/>查询 full_to_swa_index_mapping"]:::reused
+        SWAPages["SWA page ids"]:::neutral
+        OtherTables["[复用] req_to_token_c128<br/>两张 state request table"]:::reused
+        OtherPages["C128/state page ids"]:::neutral
+
+        BaseTable --> FullPages
+        FullPages --> C4Pages
+        FullPages --> IndexPages
+        BaseTable --> Translate --> SWAPages
+        RemainingWrite --> OtherTables --> OtherPages
+    end
+
+    Buffers["[复用] get_pd_state_components()<br/>C4/Indexer 仍注册不同 buffer"]:::reused
+    StateTypes["[复用] AscendStateType<br/>每个 StateType 对应一组 ptr/item_len/index"]:::reused
+    Dispatch["[复用] AscendKVManager generic page dispatch<br/>并校验源/目标 index 数量一致"]:::reused
+    Transfer["结果：page id 可共享，数据 buffer 仍按 StateType 分别传输"]:::result
+
+    Entry --> Prealloc
+    C4Pages --> StateTypes
+    IndexPages --> StateTypes
+    SWAPages --> StateTypes
+    OtherPages --> StateTypes
+    Buffers --> StateTypes --> Dispatch --> Transfer
+
+    classDef reused fill:#E8F1FB,stroke:#3B82F6,color:#0F172A,stroke-width:1.5px;
+    classDef added fill:#E8F7EE,stroke:#22A06B,color:#0F172A,stroke-width:1.5px;
+    classDef changed fill:#FFF4D6,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef deleted fill:#FDECEC,stroke:#D14343,color:#7F1D1D,stroke-width:2px,stroke-dasharray:5 3;
+    classDef neutral fill:#F4F5F7,stroke:#6B7280,color:#0F172A,stroke-width:1.5px;
+    classDef result fill:#EEE8FF,stroke:#7C3AED,color:#0F172A,stroke-width:2px;
+    style PreallocAfter fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
+    style PayloadAfter fill:#FFF9EB,stroke:#D97706,color:#0F172A,stroke-width:2px;
+```
+
+### 5.2 Ascend connector 的保留与后续收敛
+
+`disaggregation/ascend/conn.py` 中没有直接读取 allocator 或 request table；它消费的是上游已经构造好的 `state_indices`，再把每个 StateType 对应的 buffer 指针、`item_len` 和源/目标 index 交给通用 page-indexed 传输。因此，改动一**没有可以直接删除的 connector 分支**：
+
+| Ascend connector 对象 | 改动一后的处理 | 说明 |
+| --- | --- | --- |
+| `AscendStateType.DSV4_SWA` | 保留 | SWA buffer 仍独立，page id 经 full→SWA mapping 得到 |
+| `AscendStateType.DSV4_C4` | 保留 | 标识 C4 KV buffer component；不代表 C4 allocator |
+| `AscendStateType.DSV4_INDEXER` | 保留 | 与 C4 共用 index，但指向独立 Index K/scale buffers 和不同 `item_len` |
+| `AscendStateType.DSV4_C128` | 保留 | C128 buffer 和独立地址体系不变 |
+| `DSV4_C4_STATE` / `DSV4_C128_STATE` | 改动一保留 | 改动二保留 component 名称，但 `item_len/index` 语义切换为完整 ring bank |
+| `_is_generic_kvcache_state_type()` 扩展 | 保留 | 六类 component 当前都走 `_send_kvcache_generic()` page-indexed 传输 |
+| `_requires_exact_state_index_match()` 扩展 | 保留 | Prefill/Decode page list 必须位置对齐，不能静默截断 |
+| `register_buffer_to_engine()` 的 state component 注册 | 保留 | allocator 删除不释放或合并物理数据 buffer |
+
+可以做的 connector 收敛有两项，但都不是改动一的必需删除：
+
+1. 将 `_DSV4_KVCACHE_STATE_TYPES` 拆成 KV component 组（SWA/C4/C128/Indexer）和 ring-state component 组（C4/C128 state）：前者继续要求源/目标 page index 精确匹配，后者允许 source/destination request bank 重映射。
+2. 如果希望连 metadata 也去重，可以增加 `DSV4_INDEXER → DSV4_C4` 的 index alias，让 connector 只序列化一次共享 page list，再分别配对两个 component 的 buffer 指针。当前 `state_indices` 与 `state_types` 是位置并行数组，直接删除 `DSV4_INDEXER` 或它的 index entry 会导致后续 component 全部错位，因此必须先扩展协议，不能在 `conn.py` 内单点删除。
+
+所以改动一的推荐范围是：先在 `dsv4_state_payloads()` 内复用同一次 C4/Indexer page-list 构造，保持 connector 协议和六个 StateType 不变；metadata alias 作为独立优化，不阻塞地址空间重构。
+
+### 5.3 改动二后的 PD ring payload
 
 | 数据 | 完成改动一后 | 完成改动二后 |
 | --- | --- | --- |
-| SWA KV | 从 base `req_to_token` 取得 full loc，经 `full_to_swa_index_mapping` 得到 SWA page | 不变 |
-| C4 KV | 根据 full block table 得到 page id，按 C4 page size 32 传输 | 不变 |
-| Indexer K/scale | 与 C4 使用同一组 full page id，但传输独立 Indexer buffer | 不变 |
-| C128 KV | 继续通过 `req_to_token_c128` 获取 page | 不变 |
-| C4/C128 state | 暂时继续通过两张 state request table 传输 paged state | 不再构造 state page list，改为传输 ring 的有效数据和位置 metadata |
+| SWA KV | base `req_to_token` → full→SWA mapping → SWA page ids | 不变 |
+| C4 KV | full page ids，C4 page size 32 | 不变 |
+| Indexer K/scale | 与 C4 共用 page ids，传输独立 buffer | 不变 |
+| C128 KV | `req_to_token_c128` → C128 page ids | 不变 |
+| C4A/C4Li state | 两张 buffer 复用 `req_to_token_c4_state` 的 paged page list | 两张 buffer 复用 `[source_req_pool_idx] → [destination_req_pool_idx]` bank 映射 |
+| C128A state | `req_to_token_c128_state` 的 paged page list | `[source_req_pool_idx] → [destination_req_pool_idx]` bank 映射 |
 
-ring state 的 source bank 不能直接作为 decode 侧地址使用：C4/Indexer state 的 bank 绑定 SWA physical page，C128 state 的 bank 绑定 request slot，而这些 id 在 prefill、decode 两侧可能不同。payload 应使用 request 内的逻辑位置描述有效 state，decode 侧再根据本地 SWA mapping 或 request slot 写入目标 ring bank。
+`get_pd_state_components()` 对 ring state 的每个物理 tensor 仍注册独立指针，但 `item_len` 改为一个完整 bank 的字节数。`DSV4_C4_STATE` component 可以包含同层序排列的 C4A/C4Li buffer，它们使用相同的一项 bank index；`DSV4_C128_STATE` 包含 C128A buffer。
 
-PD 侧需要保留三个约束：C4 与 Indexer 共用 page id 但分别传输 buffer；C4 的传输粒度使用 page size 32；ring payload 同时携带有效范围和游标，避免 decode 侧把无效或被覆盖的 state 当作历史状态。
+Prefill 与 Decode 的 `req_pool_idx` 不要求相同。发送侧构造 source bank list，接收侧构造 destination bank list，Ascend connector 只要求二者元素数量和顺序一致，然后逐项完成 bank remap。KV component 仍保留 exact index match，不能因为 state 支持重映射而放松 KV page 校验。
 
-> 当前代码索引：[DSV4 PD payload](dsv4_common_hooks.py#L92-L190) · [PD 预分配适配](dsv4_common_hooks.py#L847-L920) · [SWA 地址映射](../../../mem_cache/allocator/swa.py#L147-L150) · [ring 地址转换](../../../mem_cache/deepseek_v4_compress_state.py#L173-L195)
+由于 ring slot 由绝对位置取模确定，只要 Prefill/Decode 使用相同 ring size，复制完整 bank 后即可凭 committed sequence length 继续 decode，不需要额外 cursor。接收侧在传输前清目标 bank，防止没有被有效 state 覆盖的字节保留上一个 request 的内容。
+
+> 当前代码索引：[DSV4 PD payload](dsv4_common_hooks.py#L84-L197) · [PD 预分配适配](dsv4_common_hooks.py#L200-L290) · [PD buffer 注册](../../../disaggregation/utils.py#L960-L1001) · [Ascend StateType 与分发](../../../disaggregation/ascend/conn.py#L23-L43) · [exact-index 校验](../../../disaggregation/ascend/conn.py#L38-L43)
 
 ## 6. 分步目标结构
 
@@ -518,14 +932,16 @@ PD 侧需要保留三个约束：C4 与 Indexer 共用 page id 但分别传输 b
 | C4 KV | page=128 + 独立 allocator/table | 独立 buffer，page=32，复用 full page id |
 | C4 Indexer | 独立 pool，page=128 | 独立 pool，page=32，与 C4 共享 full 地址 |
 | C128 KV | 独立 allocator + `req_to_token_c128` | 不变 |
-| C4 attention/Indexer state | paged allocator + `req_to_token_c4_state` | 独立 ring tensor，使用 SWA-page bank |
-| C128 state | paged allocator + `req_to_token_c128_state` | 独立 ring tensor，使用 request bank |
+| C4 attention/Indexer state | paged allocator + `req_to_token_c4_state` | 两个独立 ring tensor，统一使用 `req_pool_idx` bank |
+| C128 state | paged allocator + `req_to_token_c128_state` | 独立 ring tensor，统一使用 `req_pool_idx` bank |
+| PD Compressor state | 按 state request table 构造 page list，要求源/目标 page 对齐 | 传输完整 source bank 到 destination bank，允许两侧 `req_pool_idx` 不同 |
 
 这一步完成后：
 
 - allocator：6 个 → 3 个，仅保留 full、SWA 和 C128。
 - DSV4 辅助 request table：5 张 → 1 张，仅保留 `req_to_token_c128`。
 - 加上通用 base `req_to_token`，最终共保留两张 request→token table。
+- 单机和 PD 的 Compressor state 都只使用 request-scoped ring，不再存在 paged state page list。
 
 ```text
 重构前：6 个 allocator / 5 张辅助 request table
@@ -534,3 +950,20 @@ PD 侧需要保留三个约束：C4 与 Indexer 共用 page id 但分别传输 b
 ```
 
 > 改动文件索引：[pool 布局](dsv4_memory_pool.py#L47-L272) · [allocator](dsv4_allocator.py#L122-L188) · [request table](dsv4_req_to_token_pool.py#L43-L101) · [table/state hooks](dsv4_common_hooks.py#L242-L373) · [forward 分配结果](../../../model_executor/forward_batch_info.py#L261-L322) · [attention/compressor metadata](../attention/ascend_dsv4_backend.py#L242-L430)
+
+## 7. 后续任务：DSV4 全组件 Prefix Cache
+
+以下任务在本次 mempool 重构完成后实施，不阻塞当前重构。
+
+### 7.1 单机全组件 Prefix Cache
+
+- Full 继续作为主 Radix Tree；SWA 通过 full→SWA mapping、C4/Indexer 通过 full page id 复用，并与对应 full 节点绑定生命周期。
+- C128 使用独立 Radix Tree 保存 C128 page loc；最终命中长度取所有必需组件的共同前缀，并满足各组件 page/compress 对齐约束。
+- C4/C128 compressor ring state 不能直接随 token page 复用，需要保存命中边界的 state checkpoint，或从最近 checkpoint 重算；具体方案后续确定。
+- 统一处理各组件引用计数、淘汰和回收，覆盖 Full、SWA、C4、Indexer、C128 及 compressor state 的命中正确性和 page/bank 复用测试。
+
+### 7.2 PD 分离适配
+
+- Prefill 端传输 Full、SWA、C4、Indexer、C128 以及必要的 compressor state/checkpoint 和有效前缀元信息；Decode 端按本地地址体系恢复所有组件。
+- P/D 不直接复用物理 page/bank loc；Decode 端完成本地分配、地址映射和数据传输后，再原子发布对应 Prefix Cache 条目。
+- 任一组件传输失败或请求取消时回滚全部目标资源，覆盖跨实例全组件命中、传输后继续 decode 和淘汰复用测试。

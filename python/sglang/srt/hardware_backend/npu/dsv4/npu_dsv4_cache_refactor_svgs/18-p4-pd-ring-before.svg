@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1950" height="470" viewBox="0 0 1950 470" role="img" aria-labelledby="title desc">
+  <title id="title">子改动四重构前</title><desc id="desc">PD Compressor state 通过 source 与 destination paged state table 传输 page list。</desc>
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0 0L0 6L9 3z" fill="#64748B"/></marker><style>.h{font:700 25px sans-serif;fill:#0F172A}.p{font:15px sans-serif;fill:#475569}.b{rx:12;ry:12;stroke-width:2}.gray{fill:#F4F5F7;stroke:#6B7280}.red{fill:#FDECEC;stroke:#D14343;stroke-dasharray:7 5}.orange{fill:#FFF4D6;stroke:#D97706}.purple{fill:#EEE8FF;stroke:#7C3AED}.t{font:700 16px sans-serif;fill:#0F172A;text-anchor:middle}.s{font:14px sans-serif;fill:#334155;text-anchor:middle}.e{fill:none;stroke:#64748B;stroke-width:2.5;marker-end:url(#a)}</style></defs>
+  <text x="35" y="45" class="h">子改动 4 重构前：PD 传输 paged Compressor state</text><text x="35" y="75" class="p">两侧先通过 state allocator/table 得到 page list，Ascend connector 要求源/目标 page index 精确一致。</text>
+  <rect x="35" y="105" width="270" height="100" class="b gray"/><text x="170" y="143" class="t">Prefill request</text><text x="170" y="173" class="s">req_pool_idx / seq_len</text>
+  <rect x="350" y="105" width="300" height="100" class="b red"/><text x="500" y="143" class="t">Source state table</text><text x="500" y="173" class="s">构造 source page ids</text>
+  <rect x="35" y="295" width="270" height="100" class="b gray"/><text x="170" y="333" class="t">Decode prealloc</text><text x="170" y="363" class="s">destination request slot</text>
+  <rect x="350" y="295" width="300" height="100" class="b red"/><text x="500" y="333" class="t">Destination allocator/table</text><text x="500" y="363" class="s">构造 destination page ids</text>
+  <rect x="735" y="175" width="320" height="140" class="b orange"/><text x="895" y="213" class="t">Ascend exact match</text><text x="895" y="243" class="s">src page ids == dst page ids</text><text x="895" y="270" class="s">所有 DSV4 component</text><text x="895" y="297" class="s">同一校验语义</text>
+  <rect x="1140" y="185" width="330" height="120" class="b red"/><text x="1305" y="223" class="t">Paged state transfer</text><text x="1305" y="253" class="s">item_len=one state page</text><text x="1305" y="280" class="s">C4/C128 page list</text>
+  <rect x="1555" y="185" width="330" height="120" class="b purple"/><text x="1720" y="223" class="t">结果</text><text x="1720" y="253" class="s">PD state 传输</text><text x="1720" y="280" class="s">绑定分页地址体系</text>
+  <path d="M305 155H350M650 155H695V220H735M305 345H350M650 345H695V270H735M1055 245H1140M1470 245H1555" class="e"/>
+</svg>

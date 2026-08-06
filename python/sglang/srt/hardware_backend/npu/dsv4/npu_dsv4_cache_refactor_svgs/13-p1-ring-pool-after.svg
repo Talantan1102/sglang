@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="470" viewBox="0 0 1900 470" role="img" aria-labelledby="title desc">
+  <title id="title">子改动一重构后</title><desc id="desc">保留 NPUCompressStatePool 类和接口，按实际 request slot 容量原地改成三类 per-layer ring，并删除 state allocator、lens、loc 和 paged sizing。</desc>
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0 0L0 6L9 3z" fill="#64748B"/></marker><style>.h{font:700 25px sans-serif;fill:#0F172A}.p{font:15px sans-serif;fill:#475569}.b{rx:12;ry:12;stroke-width:2}.gray{fill:#F4F5F7;stroke:#6B7280}.green{fill:#E8F7EE;stroke:#22A06B}.orange{fill:#FFF4D6;stroke:#D97706}.purple{fill:#EEE8FF;stroke:#7C3AED}.t{font:700 16px sans-serif;fill:#0F172A;text-anchor:middle}.s{font:14px sans-serif;fill:#334155;text-anchor:middle}.e{fill:none;stroke:#64748B;stroke-width:2.5;marker-end:url(#a)}</style></defs>
+  <text x="35" y="45" class="h">子改动 1 重构后：Ring storage ownership</text><text x="35" y="75" class="p">原地 ring 化 NPUCompressStatePool，同时删除 paged sizing、state allocator/lens/loc；KV bundle 不再带 state。</text>
+  <rect x="35" y="175" width="300" height="100" class="b gray"/><text x="185" y="213" class="t">req_to_token.shape[0]</text><text x="185" y="243" class="s">slot 0 dummy，1..N active</text>
+  <rect x="390" y="175" width="300" height="100" class="b orange"/><text x="540" y="213" class="t">NPUCompressStatePool</text><text x="540" y="243" class="s">同一类改为连续 ring tensor</text>
+  <rect x="760" y="105" width="360" height="85" class="b orange"/><text x="940" y="138" class="t">per-layer C4A pools</text><text x="940" y="166" class="s">[req_slots, ring4, 2048]</text>
+  <rect x="760" y="210" width="360" height="85" class="b orange"/><text x="940" y="243" class="t">per-layer C4Li pools</text><text x="940" y="271" class="s">[req_slots, ring4, 512]</text>
+  <rect x="760" y="315" width="360" height="85" class="b orange"/><text x="940" y="348" class="t">per-layer C128A pools</text><text x="940" y="376" class="s">[req_slots, ring128, 1024]</text>
+  <rect x="1190" y="175" width="320" height="100" class="b orange"/><text x="1350" y="213" class="t">KV-only allocation bundle</text><text x="1350" y="243" class="s">无 state allocator/lens/loc</text>
+  <rect x="1570" y="175" width="290" height="100" class="b purple"/><text x="1715" y="213" class="t">结果</text><text x="1715" y="243" class="s">bank=req_pool_idx</text>
+  <path d="M335 225H390M690 225H725V147H760M690 225H760M690 225H725V357H760M1120 147H1150V225H1190M1120 252H1190M1120 357H1150V225H1190M1510 225H1570" class="e"/>
+</svg>

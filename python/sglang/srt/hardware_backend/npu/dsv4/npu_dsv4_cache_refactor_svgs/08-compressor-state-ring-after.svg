@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="610" viewBox="0 0 2000 610" role="img" aria-labelledby="title desc">
+  <title id="title">Compressor state request-scoped ring 重构后</title>
+  <desc id="desc">展示三类 state pool 统一使用 req_pool_idx bank，通过 start_pos 与 seqused 调用 cache_mode 2 Compressor。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#64748B"/></marker>
+    <style>
+      .title{font:700 25px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#0F172A}.sub{font:15px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#475569}.box{rx:10;ry:10;stroke-width:2}.reused{fill:#E8F1FB;stroke:#3B82F6}.added{fill:#E8F7EE;stroke:#22A06B}.changed{fill:#FFF4D6;stroke:#D97706}.neutral{fill:#F4F5F7;stroke:#6B7280}.result{fill:#EEE8FF;stroke:#7C3AED}.group{fill:#FFF9EB;stroke:#D97706;stroke-width:2;rx:14;ry:14}.t{font:600 16px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#0F172A;text-anchor:middle}.s{font:14px "Noto Sans SC","Microsoft YaHei",sans-serif;fill:#334155;text-anchor:middle}.edge{fill:none;stroke:#64748B;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <text x="40" y="45" class="title">改动二后：三类 Compressor state 统一使用 request-scoped ring</text>
+  <text x="40" y="74" class="sub">bank=req_pool_idx；offset=(start_pos + token_offset) % ring_size。无 state allocator、state loc 或 state request table。</text>
+
+  <rect x="40" y="180" width="210" height="100" class="box neutral"/><text x="145" y="219" class="t">ScheduleBatch</text><text x="145" y="246" class="s">Prefill / Decode / Verify</text>
+  <rect x="300" y="125" width="250" height="100" class="box reused"/><text x="425" y="164" class="t">req_pool_indices</text><text x="425" y="191" class="s">1..N active，0=dummy</text>
+  <rect x="300" y="260" width="250" height="115" class="box reused"/><text x="425" y="297" class="t">Sequence Metadata</text><text x="425" y="325" class="s">start_pos / seqused</text><text x="425" y="350" class="s">cu_seqlens</text>
+  <rect x="610" y="125" width="290" height="100" class="box changed"/><text x="755" y="164" class="t">compress_state_bank</text><text x="755" y="191" class="s">req_pool_indices → INT32[B]</text>
+
+  <rect x="970" y="95" width="440" height="405" class="group"/><text x="1190" y="128" class="t">NPUCompressStatePool：三类 per-layer ring</text>
+  <rect x="1010" y="160" width="360" height="82" class="box changed"/><text x="1190" y="191" class="t">C4A Attention State</text><text x="1190" y="217" class="s">[req_slots, ring4, 2048] FP32</text>
+  <rect x="1010" y="270" width="360" height="82" class="box changed"/><text x="1190" y="301" class="t">C4Li Indexer State</text><text x="1190" y="327" class="s">[req_slots, ring4, 512] FP32</text>
+  <rect x="1010" y="380" width="360" height="82" class="box changed"/><text x="1190" y="411" class="t">C128A Attention State</text><text x="1190" y="437" class="s">[req_slots, ring128, 1024] FP32</text>
+
+  <rect x="1480" y="180" width="300" height="145" class="box changed"/><text x="1630" y="218" class="t">custom.compressor</text><text x="1630" y="247" class="s">state_block_table=bank</text><text x="1630" y="274" class="s">cache_mode=2</text><text x="1630" y="299" class="s">算子计算 ring offset</text>
+  <rect x="1480" y="395" width="300" height="100" class="box reused"/><text x="1630" y="433" class="t">NPU Epilog</text><text x="1630" y="460" class="s">写 C4/C128 KV 或 Index K/scale</text>
+  <rect x="1830" y="285" width="140" height="110" class="box result"/><text x="1900" y="326" class="t">结果</text><text x="1900" y="353" class="s">KV 输出</text><text x="1900" y="378" class="s">Ring state</text>
+
+  <path d="M250 215 H300" class="edge"/><path d="M250 245 H275 V317 H300" class="edge"/><path d="M550 175 H610" class="edge"/><path d="M900 175 H930 V252 H1480" class="edge"/><path d="M550 317 H1480" class="edge"/>
+  <path d="M1370 201 H1425 V225 H1480" class="edge"/><path d="M1370 311 H1445 V252 H1480" class="edge"/><path d="M1370 421 H1425 V280 H1480" class="edge"/>
+  <path d="M1630 325 V395" class="edge"/><path d="M1780 445 H1805 V340 H1830" class="edge"/>
+
+  <rect x="610" y="520" width="800" height="60" class="box added"/><text x="1010" y="546" class="t">Bank 生命周期</text><text x="1010" y="568" class="s">新 request 取得 slot 时清 bank；chunked prefill / decode / verify 保持 bank 不变；下次 slot 复用前再清</text>
+</svg>

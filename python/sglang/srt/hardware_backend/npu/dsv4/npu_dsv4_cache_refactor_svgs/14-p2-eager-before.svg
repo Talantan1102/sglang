@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="410" viewBox="0 0 1900 410" role="img" aria-labelledby="title desc">
+  <title id="title">子改动二重构前</title><desc id="desc">Eager Compressor 使用 state request table 和二维 page table。</desc>
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0 0L0 6L9 3z" fill="#64748B"/></marker><style>.h{font:700 25px sans-serif;fill:#0F172A}.p{font:15px sans-serif;fill:#475569}.b{rx:12;ry:12;stroke-width:2}.gray{fill:#F4F5F7;stroke:#6B7280}.blue{fill:#E8F1FB;stroke:#3B82F6}.orange{fill:#FFF4D6;stroke:#D97706}.red{fill:#FDECEC;stroke:#D14343;stroke-dasharray:7 5}.purple{fill:#EEE8FF;stroke:#7C3AED}.t{font:700 16px sans-serif;fill:#0F172A;text-anchor:middle}.s{font:14px sans-serif;fill:#334155;text-anchor:middle}.e{fill:none;stroke:#64748B;stroke-width:2.5;marker-end:url(#a)}</style></defs>
+  <text x="35" y="45" class="h">子改动 2 重构前：Eager 使用 paged Compressor</text><text x="35" y="75" class="p">state request table 先转换为二维 state page table，再传给 cache_mode=1。</text>
+  <rect x="30" y="150" width="280" height="100" class="b gray"/><text x="170" y="188" class="t">Eager ForwardBatch</text><text x="170" y="218" class="s">req / seq / cu_seqlens</text>
+  <rect x="355" y="140" width="290" height="120" class="b red"/><text x="500" y="178" class="t">Eager state hooks</text><text x="500" y="208" class="s">写/读 C4、C128 table</text><text x="500" y="235" class="s">消费 state loc</text>
+  <rect x="690" y="140" width="330" height="120" class="b red"/><text x="855" y="178" class="t">_compute_compress_locs()</text><text x="855" y="208" class="s">state_page_table</text><text x="855" y="235" class="s">INT32[B, max_pages]</text>
+  <rect x="1065" y="140" width="310" height="120" class="b orange"/><text x="1220" y="178" class="t">custom.compressor</text><text x="1220" y="208" class="s">cache_mode=1</text><text x="1220" y="235" class="s">paged state_cache</text>
+  <rect x="1420" y="150" width="230" height="100" class="b blue"/><text x="1535" y="188" class="t">NPU Epilog</text><text x="1535" y="218" class="s">KV / Indexer 写入</text>
+  <rect x="1695" y="150" width="175" height="100" class="b purple"/><text x="1782" y="188" class="t">结果</text><text x="1782" y="218" class="s">Paged state</text>
+  <path d="M310 200H355M645 200H690M1020 200H1065M1375 200H1420M1650 200H1695" class="e"/>
+</svg>
