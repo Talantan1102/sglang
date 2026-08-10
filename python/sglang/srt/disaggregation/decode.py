@@ -1204,7 +1204,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
-            if hasattr(self.req_to_token_pool, "req_to_token_c128"):
+            if hasattr(self.req_to_token_pool, "req_to_c128_sidecar"):
                 # DSV4 on NPU: per-pool dst page indices, produced by the same
                 # shared builder prefill uses so src/dst line up positionally.
                 if total_prefix_len != 0:

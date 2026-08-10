@@ -35,9 +35,9 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
     K_nope + K_rope as bf16. C4 uses its native 32-token page so its physical
-    page id can be shared with the corresponding 128-token full page. C128
-    cannot use its native page size 1 in the NPU kernel and therefore keeps the
-    global kernel page size. SWA uses ``kernel_page_size == page_size``.
+    page id can be shared with the corresponding 128-token full page. C128 uses
+    a 16-slot sidecar page for each 2048-token Full logical group. SWA uses
+    ``kernel_page_size == page_size``.
     The CUDA fp8-packed-bytes layout (the base ``create_buffer``) is untouched.
     """
 
@@ -257,6 +257,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # C4 uses its native page size; other pools keep the global page size.
         is_c4_pool = page_size * 4 == global_page_size
         kernel_page_size = page_size if is_c4_pool else global_page_size
+        if page_size == 1:
+            kernel_page_size = 16
         return NPUDeepSeekV4SingleKVPool(
             size,
             page_size,

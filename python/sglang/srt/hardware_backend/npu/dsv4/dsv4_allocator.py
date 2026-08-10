@@ -15,7 +15,7 @@ Per ``alloc_extend`` / ``alloc_decode``:
 The bundle is the explicit return value:
 mem_cache/common.py unpacks ``out_full_loc`` and stashes the bundle on
 ``batch.out_cache_loc_dsv4``; ``DSV4NPUReqToTokenPool`` writes the per-req
-``req_to_token_c128`` table that :meth:`free` and the last_loc lookup read back.
+``req_to_c128_sidecar`` table that :meth:`free` and the last_loc lookup read back.
 """
 
 from __future__ import annotations
@@ -33,29 +33,31 @@ from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
+C128_PAGE_SIZE = 16
+
 
 def get_last_loc(
-    req_to_token: torch.Tensor,
+    req_to_c128_sidecar: torch.Tensor,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
 ) -> torch.Tensor:
     """Slot id of each req's last already-allocated token, or -1 when
     ``prefix_lens[i] == 0`` (fresh req).
 
-    Looks up ``req_to_token[req, prefix_lens - 1]`` to anchor the paged
-    allocator's ``alloc_extend`` on the real previous tail slot, preserving the
-    intra-page slot continuity the kernel's ``cmp_block_table`` relies on (the
-    allocator debug-asserts ``(last_loc + 1) % page_size == prefix_lens %
-    page_size``). Result dtype matches ``prefix_lens``.
+    Looks up the C128 sidecar page to anchor the paged allocator's
+    ``alloc_extend`` on the real previous tail slot, preserving intra-page slot
+    continuity. Result dtype matches ``prefix_lens``.
     """
     req_pool_indices = req_pool_indices.to(torch.int64)
-    safe_idx = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
-    looked_up = req_to_token[req_pool_indices, safe_idx].to(prefix_lens.dtype)
-    return torch.where(
-        prefix_lens > 0,
-        looked_up,
-        torch.full_like(prefix_lens, -1),
+    last_pos = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
+    page_ids = req_to_c128_sidecar[
+        req_pool_indices, last_pos // C128_PAGE_SIZE
+    ].to(prefix_lens.dtype)
+    last_loc = (
+        page_ids * C128_PAGE_SIZE
+        + last_pos.to(prefix_lens.dtype) % C128_PAGE_SIZE
     )
+    return torch.where(prefix_lens > 0, last_loc, torch.full_like(prefix_lens, -1))
 
 
 def alloc_paged_token_slots_extend_npu(*args, batch=None, **kwargs):
@@ -126,7 +128,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # paged allocator. pool_size is in compressed-token units.
             return NPUPagedTokenToKVPoolAllocator(
                 pool_size,
-                page_size=page_size,
+                page_size=C128_PAGE_SIZE,
                 dtype=dtype,
                 device=device,
                 kvcache=pool,
@@ -134,6 +136,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
 
         self.c128_attn_allocator = mk(kvcache.c128_size, kvcache.c128_kv_pool)
+        self.c128_page_refcount = torch.zeros(
+            self.c128_attn_allocator.num_pages + 1,
+            dtype=torch.int32,
+            device=device,
+        )
 
         # Returned by the c-pool helpers when a step adds no compressed tokens.
         self._empty_loc = torch.empty((0,), dtype=torch.int64, device=device)
@@ -161,6 +168,41 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         completed_group = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
         return out_full_loc[completed_group] // 4
 
+    def retain_c128_pages(self, page_ids: torch.Tensor) -> None:
+        page_ids = page_ids.to(torch.int64).view(-1)
+        if page_ids.numel() == 0:
+            return
+        self.c128_page_refcount.index_add_(
+            0,
+            page_ids,
+            torch.ones_like(page_ids, dtype=self.c128_page_refcount.dtype),
+        )
+
+    def release_c128_pages(self, page_ids: torch.Tensor) -> None:
+        page_ids = torch.unique(page_ids.to(torch.int64).view(-1))
+        page_ids = page_ids[page_ids > 0]
+        if page_ids.numel() == 0:
+            return
+        self.c128_page_refcount.index_add_(
+            0,
+            page_ids,
+            -torch.ones_like(page_ids, dtype=self.c128_page_refcount.dtype),
+        )
+        free_pages = page_ids[self.c128_page_refcount[page_ids] == 0]
+        if free_pages.numel() > 0:
+            self.c128_attn_allocator.free(free_pages * C128_PAGE_SIZE)
+
+    def replace_req_c128_prefix(
+        self, req_pool_idx: int, page_ids: torch.Tensor, req_to_token_pool
+    ) -> None:
+        table = req_to_token_pool.req_to_c128_sidecar
+        page_ids = page_ids.to(device=table.device, dtype=table.dtype).view(-1)
+        old = table[req_pool_idx, : page_ids.numel()].clone()
+        changed = old != page_ids
+        self.release_c128_pages(old[changed])
+        self.retain_c128_pages(page_ids[changed])
+        table[req_pool_idx, : page_ids.numel()] = page_ids
+
     @staticmethod
     def _pool_exhausted(
         ratio: int, kind: str, need: int, available: int
@@ -187,7 +229,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Allocate compressed-KV slots for an extend at ``ratio``.
 
         Prefix/seq lens are translated to compressed units (``// ratio``); the
-        c-pool last_loc comes from ``req_to_token_c128`` via
+        c-pool last_loc comes from ``req_to_c128_sidecar`` via
         :func:`get_last_loc` so the paged allocator continues in-page (or opens
         a fresh page at a ratio boundary), keeping the intra-page continuity the
         ``cmp_block_table`` reader relies on. Returns ``_empty_loc`` when this
@@ -201,7 +243,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "alloc_extend/alloc_decode must be called with req_to_token_pool= "
             "for the c-pool last_loc lookup."
         )
-        c_table = self._cur_req_to_token_pool.req_to_token_c128
+        c_table = self._cur_req_to_token_pool.req_to_c128_sidecar
         c_prefix = (prefix_lens // ratio).to(prefix_lens.dtype)
         c_seq = (seq_lens // ratio).to(seq_lens.dtype)
         c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
@@ -221,6 +263,18 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 ratio, "KV", c_extend, allocator.available_size()
             )
         return result
+
+    def _has_c128_sidecar_capacity(
+        self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> bool:
+        prefix_groups = (
+            prefix_lens_cpu // 128 + C128_PAGE_SIZE - 1
+        ) // C128_PAGE_SIZE
+        seq_groups = (
+            seq_lens_cpu // 128 + C128_PAGE_SIZE - 1
+        ) // C128_PAGE_SIZE
+        need = int((seq_groups - prefix_groups).clamp(min=0).sum().item())
+        return need <= self.c128_attn_allocator.available_size() // C128_PAGE_SIZE
 
     def _alloc_compressed_kv(
         self,
@@ -271,6 +325,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Stash per-req tables for this call's last_loc lookups (read by
         # _alloc_c_extend / _alloc_state_extend); no permanent allocator->pool ref.
         self._cur_req_to_token_pool = req_to_token_pool
+        if not self._has_c128_sidecar_capacity(prefix_lens_cpu, seq_lens_cpu):
+            return None
         out_full_loc = super().alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -329,6 +385,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         req_to_token_pool=None,
     ) -> Optional[DSV4OutCacheLoc]:
         self._cur_req_to_token_pool = req_to_token_pool
+        if not self._has_c128_sidecar_capacity(
+            (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
+        ):
+            return None
         out_full_loc = super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)
         if out_full_loc is None:
             return None
@@ -366,6 +426,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         full+swa-tail, then _alloc_compressed_kv adds c4/c128 KV → DSV4OutCacheLoc.
         """
         self._cur_req_to_token_pool = req_to_token_pool
+        if not self._has_c128_sidecar_capacity(prefix_lens_cpu, seq_lens_cpu):
+            return None
         out_full_loc = super().alloc_extend_swa_tail(
             prefix_lens,
             prefix_lens_cpu,
@@ -412,19 +474,23 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if kv_len <= 0 or req_pool_idx is None:
             return
 
-        # KV pools: free the leading [0, kv_len // ratio) compressed slots.
-        for ratio, allocator, table_attr in (
-            (128, self.c128_attn_allocator, "req_to_token_c128"),
-        ):
-            n = kv_len // ratio
-            if n > 0 and hasattr(req_to_token_pool, table_attr):
-                slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, :n]
-                slots = slots[slots > 0]
-                # to int64 — paged allocator's free does cpu()//page_size on it.
-                if slots.numel() > 0:
-                    allocator.free(slots.to(torch.int64))
-
+        row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
+        self.release_c128_pages(row[row > 0])
+        row.zero_()
         self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
+
+    def available_size(self):
+        return min(
+            super().available_size(),
+            self.c128_attn_allocator.available_size() * 128,
+        )
+
+    def resize(self, config) -> None:
+        self.c128_attn_allocator.size = int(config.c128_max_total_num_tokens)
+        self.c128_attn_allocator.num_pages = (
+            self.c128_attn_allocator.size // C128_PAGE_SIZE
+        )
+        super().resize(config)
 
     def clear(self):
         super().clear()
@@ -433,3 +499,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             allocator = getattr(self, attr, None)
             if allocator is not None:
                 allocator.clear()
+        refcount = getattr(self, "c128_page_refcount", None)
+        if refcount is not None:
+            refcount.zero_()

@@ -998,17 +998,120 @@ flowchart LR
 
 ## 7. 后续任务：DSV4 全组件 Prefix Cache
 
-以下任务在本次 mempool 重构完成后实施，不阻塞当前重构。
+本节不是改动一、改动二的汇总：第 6 节已经汇总两项重构的最终结构；第 7 节描述后续 Prefix Cache 工作，其中 7.1 给出单机总体目标，7.2 展开 C128 KV 的专项设计，7.3 再把单机方案扩展到 PD 分离。
 
-### 7.1 单机全组件 Prefix Cache
+> 实现状态（2026-08-07）：7.1/7.2 的单机 sidecar、Eager、Graph/MTP 和 Unified Radix 生命周期已完成代码接入；7.3 的 Decode 侧 Prefix Cache 增量传输仍未实施，`total_prefix_len != 0` 的原有限制继续保留。
+
+### 7.1 单机 Prefix Cache 总体目标
 
 - Full 继续作为主 Radix Tree；SWA 通过 full→SWA mapping、C4/Indexer 通过 full page id 复用，并与对应 full 节点绑定生命周期。
-- C128 使用独立 Radix Tree 保存 C128 page loc；最终命中长度取所有必需组件的共同前缀，并满足各组件 page/compress 对齐约束。
-- C4/C128 compressor ring state 不能直接随 token page 复用，需要保存命中边界的 state checkpoint，或从最近 checkpoint 重算；具体方案后续确定。
+- 在不修改 `npu_sparse_attn_sharedkv` 的前提下，C128 KV 不再优先考虑独立 Radix Tree，而是采用下面的 16-Full-page group sidecar：一个 C128 物理页保存连续 16 个 Full page 的 C128 结果，并随对应 Full prefix group 管理生命周期。
+- C4A/C4Li state 跟随 SWA 的地址索引和生命周期：无论命中或交接位置是否在 2048 边界，继续计算都必须有有效 C4 state；单机命中时通过本地 `swa_loc` 找到，PD 时随 `StateType.SWA` 从 Prefill 的 SWA/state 位置搬到 Decode 新分配的位置。
+- C128A state 只服务当前未完成的 128-token 分组：在 128 边界上继续计算不需要恢复历史 C128 state。C128 Prefix Cache 命中长度必须是一个完整 C128 sidecar page 对应的原始 token 数，即 2048 的倍数；但 PD 最终交接长度可以不在边界，此时必须传输未完成分组的 C128 state。
 - 统一处理各组件引用计数、淘汰和回收，覆盖 Full、SWA、C4、Indexer、C128 及 compressor state 的命中正确性和 page/bank 复用测试。
 
-### 7.2 PD 分离适配
+### 7.2 C128 KV group sidecar 详细方案
 
-- Prefill 端传输 Full、SWA、C4、Indexer、C128 以及必要的 compressor state/checkpoint 和有效前缀元信息；Decode 端按本地地址体系恢复所有组件。
-- P/D 不直接复用物理 page/bank loc；Decode 端完成本地分配、地址映射和数据传输后，再原子发布对应 Prefix Cache 条目。
-- 任一组件传输失败或请求取消时回滚全部目标资源，覆盖跨实例全组件命中、传输后继续 decode 和淘汰复用测试。
+本节只讨论 C128 KV，不改变改动二中 C128 Compressor state 的 request-position ring。目标是在不修改当前 Sparse Attention 算子的情况下，让 C128 KV 的 ownership 跟随 Full Radix Cache，并用 group→page 映射取代 `req_to_token_c128`。
+
+#### 7.2.1 算子约束与绑定粒度
+
+当前 `npu_sparse_attn_sharedkv` 的 PA 路径要求 C128 `cmp_block_size` 在 `[1, 1024]` 内且按 16 对齐。算子对一个 `cmp_block_table` 表项的读取方式是：先选择一个 C128 物理页，再连续读取该页的 slot 0～15。因此不能把 16 个 C128 token 分散到 16 个物理页的 slot 0；无需修改算子的可行绑定粒度是：
+
+```text
+16 个 Full page × 128 raw token
+                │
+                ▼
+1 个 C128 sidecar page × 16 C128 slot
+
+Full page 0  → C128 slot 0
+Full page 1  → C128 slot 1
+...
+Full page 15 → C128 slot 15
+```
+
+一个 C128 page 填满需要 `16 × 128 = 2048` 个原始 token，但 C128 Attention 不需要等到 2048 token 才生效：序列达到 128 token 后 slot 0 即可被读取，`floor(seq_len / 128)` 决定本轮有效 C128 slot 数。
+
+#### 7.2.2 Pool、地址和 block table
+
+- C128 KV pool 的物理 `page_size` 改为 16；一个物理页对应一个 Full logical-page group。
+- Full logical page 序号由绝对 token 位置计算，group/slot 计算不依赖 request token table：
+
+```text
+full_logical_page = absolute_position // 128
+c128_group         = full_logical_page // 16
+c128_slot          = full_logical_page % 16
+c128_loc           = c128_physical_page_id * 16 + c128_slot
+```
+
+- `c128_physical_page_id` 不能仅从单个 Full physical page id 推导：同一逻辑 group 内的 16 个 Full page 在 Radix Cache 中不保证物理连续。因此使用 `req_to_c128_sidecar[req, group]` 保存 group→sidecar-page 映射；它每 2048 token 只有一项，不是旧的逐 128-token `req_to_token_c128`。
+- `c128_block_table[b, group]` 直接保存该 request 每个 Full logical-page group 的 sidecar page id，继续满足当前 Sparse Attention 的 `cmp_block_size=16` 寻址。
+- C128 sidecar page 在 group 第一个 Full page 完成时分配；之后每完成 128 个原始 token，Compressor epilog 写入下一个 slot。
+
+重构后的核心调用链为：
+
+```text
+Full Radix prefix pages
+        ↓ 按 16 个 Full page 分组
+group→C128 sidecar page
+        ↓ page_id × 16 + slot
+C128 Compressor epilog 写入
+        ↓ group page ids
+c128_block_table
+        ↓
+npu_sparse_attn_sharedkv（接口不变）
+```
+
+#### 7.2.3 Radix 生命周期与 request-private tail
+
+- C128 Prefix Cache 的命中和发布粒度固定为完整 sidecar page：16 个 C128 slot，对应 2048 个原始 token。对外返回的全组件命中长度必须向下对齐到 2048 的倍数。
+- 发布长前缀时，Full Radix 路径会显式生成每个 2048-token group 的边界节点，并把对应 C128 page 挂在该节点；因此即使后续在 group 内分叉，也能命中最近的完整 2048 边界，不会退回到更早节点。
+- 已填满的 16-slot C128 sidecar page 冻结为只读对象，与对应的 2048-token Full prefix group 一起进入 Radix Cache，可被多请求共享和淘汰。
+- 未填满的 tail sidecar page 不进入 Radix Cache，也不能被其他请求命中；它始终属于当前 active request，后续 C128 slot 直接原地追加。
+- tail page 填满后才能冻结并随对应 Full group 发布到 Radix Cache；请求在填满前结束时，tail page 随 request 释放，不留下可命中的部分页。
+- 已冻结 sidecar page 使用引用计数：active request、Radix node 和 PD transfer 分别持有引用，最后一个引用释放时归还 C128 page allocator；未满 tail 只由 active request 和可能的 PD transfer 持有。
+- MTP rejected suffix 即使跨过 128-token 边界，也由 committed length 限制读取；后续在同一 group/slot 覆盖，不改变现有 accepted-length 语义。
+
+#### 7.2.4 分阶段实施
+
+1. **sidecar 地址切换（已完成）**：把 C128 KV pool/allocator 的 page size 改为 16，使用 `req_to_c128_sidecar` 保存 Full logical-page group→C128 page ownership；将 `c128_loc` 改为 `page_id * 16 + slot`，并从 group page id 直接生成 `c128_block_table`。Compressor epilog、Sparse Attention、Eager 和 Graph/MTP 已改读 group sidecar；旧 `req_to_token_c128` 和 request 级 C128 page-list builder 已删除，原分配后写入 hook 只负责登记新产生的 group→page 映射。
+2. **Radix 生命周期（已完成）**：新增 C128 sidecar component，把已填满 sidecar 引用挂到 Full Radix 分支，将命中长度限制为 2048 的倍数，并加入 request/Radix 引用计数、淘汰和复用；未满 tail 保持 request-private。C128 不维护独立的路径锁和淘汰驱动，而是复用 Full 的路径锁并在 Full 淘汰时级联释放。发布时显式建立每个 2048-token 边界节点；Radix 在 group 内分叉时，完整 sidecar 留在对应边界或各自分支终点，不把两条分支的 slot 拼到同一物理页。
+3. **单机验证（进行中）**：CPU 定向单测已覆盖 16-slot 地址、`127/128/129` 与 `2047/2048/2049` 边界、长叶子的逐 group 节点、group 内分叉、SWA rebuild 对齐、引用计数与淘汰、Eager metadata 和 MTP bundle；仍需在真实 NPU 上完成 Sparse Attention、Graph replay、MTP accepted/rejected 与长稳回归。
+
+最低测试边界：
+
+- 长度 `127/128/129`：第一个 C128 slot 的产生与读取。
+- 长度 `2047/2048/2049`：tail page、整页冻结和下一 group 分配。
+- 非连续 Full physical page id：证明 group 映射不错误假设 Full page 连续。
+- 非 2048 对齐的 Full prefix：验证全组件命中长度向下收缩到最近的 2048 边界，未满 tail 不能被第二个请求命中。
+- 完整 group 的多请求共享、引用计数、Radix eviction 和物理 page 复用。
+- Graph replay、MTP accepted/rejected 边界；PD 传输后继续 decode 归入 7.3。
+
+### 7.3 PD 分离适配
+
+PD 与单机混部的根本区别是：Prefill 和 Decode 拥有各自的物理 pool，同一个逻辑 token 在两端的 `full_loc`、`swa_loc`、C128 sidecar page id 和 `req_pool_idx` 都可以不同。因此 PD 传输的是数据，而不是把 Prefill 的 loc 直接交给 Decode 使用；connector 需要将按逻辑顺序配对的 source index 数据写入 Decode 本地分配的 destination index。
+
+#### 7.3.1 Compressor state 交接规则
+
+| State | Decode 继续计算时是否需要 | PD 处理 |
+| --- | --- | --- |
+| C4A/C4Li state | 始终需要，与交接点是否为 128/2048 边界无关 | Decode 已命中的部分通过本地 `swa_loc` 找到；Prefill 新计算的增量随 `StateType.SWA` 传输，并写入 Decode 对应的 SWA/state index |
+| C128A state | 仅当最终交接长度不在 128 边界时需要 | `seq_len % 128 == 0` 时不传；否则通过 `StateType.C128_STATE` 将 Prefill 未完成分组的 state 写到 Decode 的 request-position ring |
+
+“Prefix Cache 只共享 2048 倍数”只能保证**命中点**在 C128 边界，不能保证 **PD 最终交接点**也在边界。例如 Decode 命中 `0～2047`，Prefill 最终处理到 2100：C4 仍需要有效历史 state，C128 也需要传输 `2048～2099` 形成的未完成分组 state，Decode 才能从 2100 继续。
+
+当前代码已具备这两类 state 的基础传输语义：`DSV4NPUTokenToKVPool.get_state_buf_infos()` 将 SWA KV、C4A state 和 C4Li state 注册为同一个 `StateType.SWA` component；`get_dsv4_c128_state_indices()` 在 `seq_len % 128 == 0` 时返回空 index，否则返回需要传输的 C128 state row/page。
+
+#### 7.3.2 State 解决后的剩余工作
+
+Compressor state 正确交接后没有新的计算语义障碍，剩余工作是 Prefix Cache 的地址、增量和生命周期管理：
+
+1. **Decode 本地分配**：为 Prefill 将要传输的增量分配 Full/SWA 页和 C128 sidecar page，构造 source index→destination index 的位置配对，不复用 Prefill 物理 loc。
+2. **命中与增量拼接**：保留 Decode 已命中的 Full/SWA/C4/Indexer/C128 数据，只传输 Prefix Cache 命中长度之后的 Prefill 增量，并保证增量写入不污染共享前缀页。
+3. **C128 sidecar 恢复**：Decode 为 Full logical group 分配本地 C128 page，恢复 group→page 映射。完整 group 可作为冻结缓存页共享；Prefix Cache 命中边界之后、PD 最终交接点之前形成的未满 group，只传输已产生的有效 C128 slot 到 Decode request-private tail，后续原地追加且不进入 Prefix Cache。
+4. **原子发布与回滚**：所有必要组件传输成功后才发布 Prefix Cache 条目；任一传输失败、请求取消或超时都要释放新分配的 Full/SWA/C128 资源和 transfer 引用。
+5. **组合验证**：覆盖跨实例完整/增量传输、C128 完整/未满 group、PP 分层、MTP/NextN、传输后继续 decode、淘汰和物理页复用。
+
+当前 NPU DSV4 PD 的直接缺口是 Decode 侧 Prefix Cache：`decode.py` 在 `total_prefix_len != 0` 时仍主动报错。后续实现上述本地分配、增量拼接和 sidecar 生命周期后，才能移除该限制。
+
+> 当前代码索引：[C4 state 随 SWA component 注册](dsv4_memory_pool.py#L353-L377) · [C128 state 交接边界判断](../../../disaggregation/utils.py#L81-L97) · [Decode 侧 Prefix Cache 限制](../../../disaggregation/decode.py#L1207-L1215)

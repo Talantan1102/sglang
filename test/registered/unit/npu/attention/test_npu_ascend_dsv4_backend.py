@@ -56,6 +56,7 @@ sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculat
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+    CompressorAscendBackendMixin,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _get_kv_indices,
@@ -324,6 +325,55 @@ class TestGetKvIndices(unittest.TestCase):
         result = _get_kv_indices(MagicMock(), 100, page_table, 0, 3)
         expected = page_table[0, 0:3]
         self.assertEqual(result.tolist(), expected.tolist())
+
+class TestComputeCompressedPageTable(unittest.TestCase):
+    def test_c4_reuses_full_physical_page_ids(self):
+        backend = object.__new__(CompressorAscendBackendMixin)
+        backend.page_size = 128
+        backend._dsv4_unique_compress_ratios = [4]
+
+        req_to_token = torch.empty((1, 256), dtype=torch.int32)
+        req_to_token[0, :128] = torch.arange(5 * 128, 6 * 128)
+        req_to_token[0, 128:] = torch.arange(9 * 128, 10 * 128)
+        req_to_token_pool = SimpleNamespace()
+
+        result = backend._compute_compress_locs(
+            pool=None,
+            req_to_token=req_to_token,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([132], dtype=torch.int32),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            is_decode=False,
+            bs=1,
+            device=torch.device("cpu"),
+            req_to_token_pool=req_to_token_pool,
+            out_cache_loc_dsv4=None,
+        )
+
+        self.assertEqual(result["c4_page_table"].tolist(), [[5, 9]])
+
+    def test_c128_reads_group_sidecar_page_ids(self):
+        backend = object.__new__(CompressorAscendBackendMixin)
+        backend.page_size = 128
+        backend._dsv4_unique_compress_ratios = [128]
+        req_to_token_pool = SimpleNamespace(
+            req_to_c128_sidecar=torch.tensor([[7, 11]], dtype=torch.int32)
+        )
+
+        result = backend._compute_compress_locs(
+            pool=None,
+            req_to_token=torch.empty((1, 1), dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([2176], dtype=torch.int32),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            is_decode=False,
+            bs=1,
+            device=torch.device("cpu"),
+            req_to_token_pool=req_to_token_pool,
+            out_cache_loc_dsv4=None,
+        )
+
+        self.assertEqual(result["c128_page_table"].tolist(), [[7, 11]])
 
 
 class TestStepOutCacheLoc(unittest.TestCase):

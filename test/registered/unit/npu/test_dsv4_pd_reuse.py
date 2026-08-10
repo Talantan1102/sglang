@@ -55,7 +55,7 @@ def _fake_npu_pool(swa_mapping=None):
         kv_buffer=[torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16) for _ in range(3)]
     )
     pool.c128_kv_pool = SimpleNamespace(
-        kv_buffer=[torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16)]
+        kv_buffer=[torch.zeros((4, 16, 1, 2), dtype=torch.bfloat16)]
     )
     pool.compress_state_pools = [
         _state_pool(4, 8),
@@ -104,7 +104,7 @@ class TestDSV4PDReuse(unittest.TestCase):
         self.assertEqual(len(c128_state_ptrs), 1)
         self.assertEqual(c128_state_items, [4 * 4 * 128])
         self.assertEqual(len(c128_kv_ptrs), 1)
-        self.assertEqual(c128_kv_items, [128 * 1 * 2 * 2])
+        self.assertEqual(c128_kv_items, [16 * 1 * 2 * 2])
 
     def test_setup_reuses_public_state_types(self):
         pool = _fake_npu_pool()
@@ -156,10 +156,10 @@ class TestDSV4PDReuse(unittest.TestCase):
 
     def test_c128_kv_payload_is_the_only_npu_payload(self):
         req_pool = SimpleNamespace(
-            req_to_token_c128=torch.zeros((1, 256), dtype=torch.int32)
+            req_to_c128_sidecar=torch.zeros((1, 10), dtype=torch.int32)
         )
-        req_pool.req_to_token_c128[0, 0] = 256
-        req_pool.req_to_token_c128[0, 128] = 512
+        req_pool.req_to_c128_sidecar[0, 0] = 2
+        req_pool.req_to_c128_sidecar[0, 8] = 4
 
         payloads = dsv4_state_payloads(
             req_pool,
@@ -204,12 +204,13 @@ class TestDSV4PDReuse(unittest.TestCase):
         )
         self.assertEqual(mapped_swa, [2, 3, 4, 7, 8, 10, 11])
 
-    def test_request_pool_keeps_only_c128_kv_table(self):
+    def test_request_pool_keeps_only_c128_group_sidecar_mapping(self):
         pool = object.__new__(DSV4ReqToTokenTablesMixin)
         pool._alloc_size = 2
-        pool._init_dsv4_tables(256, "cpu", False)
+        pool._init_dsv4_tables(4096, "cpu", False)
 
-        self.assertEqual(pool.req_to_token_c128.shape, (2, 2))
+        self.assertEqual(pool.req_to_c128_sidecar.shape, (2, 2))
+        self.assertFalse(hasattr(pool, "req_to_token_c128"))
         self.assertFalse(hasattr(pool, "req_to_token_c4_state"))
         self.assertFalse(hasattr(pool, "req_to_token_c128_state"))
 

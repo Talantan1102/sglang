@@ -281,7 +281,7 @@ class TestExplicitStateBlockTable(unittest.TestCase):
 
     def test_eager_metadata_does_not_read_paged_state_tables(self):
         class EagerReqToTokenPool:
-            req_to_token_c128 = torch.arange(256, dtype=torch.int64).view(1, -1)
+            req_to_c128_sidecar = torch.tensor([[7]], dtype=torch.int32)
 
             @property
             def req_to_token_c4_state(self):

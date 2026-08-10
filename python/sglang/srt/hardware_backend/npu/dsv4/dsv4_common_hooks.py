@@ -7,7 +7,7 @@ DSV4 on NPU, ``alloc_paged_token_slots_{extend,decode}`` already stashed the
 these hooks then:
 
   1. Read the bundle from ``batch.out_cache_loc_dsv4``.
-  2. Write the independently allocated C128 KV slots into the per-request table.
+  2. Write newly allocated C128 page ids into the per-request sidecar.
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and only
@@ -17,7 +17,7 @@ Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
 
 The disagg per-req prealloc path does not build a ``ScheduleBatch`` and so
-bypasses the batch hook; it writes the same tables via
+bypasses the batch hook; it writes the same sidecar via
 ``write_dsv4_prealloc_tables`` (driven by ``dsv4_unwrap_prealloc``).
 """
 
@@ -39,9 +39,9 @@ def maybe_write_dsv4_extend(
 ) -> None:
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
-    Spreads the flat ``out_c128_loc`` tensor across requests and writes the
-    resulting slot ids into ``req_to_token_c128[req, prefix:seq]``. C4
-    locations are derived from the full-token table.
+    Spreads the flat ``out_c128_loc`` tensor across requests and writes newly
+    allocated page ids into ``req_to_c128_sidecar``. C4 locations are derived
+    from the full-token table.
 
     """
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
@@ -81,17 +81,16 @@ def dsv4_state_payloads(
     prefix_len = max(0, min(int(prefix_len), seq_len))
 
     def c128_kv_pages():
-        lo = prefix_len // 128
-        hi = seq_len // 128
+        lo = prefix_len // 2048
+        hi = (seq_len // 128 + 15) // 16
         if hi <= lo:
             return np.empty((0,), dtype=np.int32)
-
-        page_lo = (lo // page_size) * page_size
-        page_hi = ((hi + page_size - 1) // page_size) * page_size
-        slots = req_to_token_pool.req_to_token_c128[
-            req_pool_idx, page_lo:page_hi:page_size
-        ]
-        pages = (slots.cpu().numpy() // page_size).astype(np.int32)
+        pages = (
+            req_to_token_pool.req_to_c128_sidecar[req_pool_idx, lo:hi]
+            .cpu()
+            .numpy()
+            .astype(np.int32)
+        )
         return pages[pages > 0]
 
     return {AscendStateType.DSV4_C128: c128_kv_pages}
@@ -150,7 +149,7 @@ def _write_dsv4_tables(
     seq_lens_cpu: torch.Tensor,
     bundle,
 ) -> None:
-    """Write the remaining independently allocated C128 KV table."""
+    """Write newly allocated C128 page ids into the request sidecar."""
     _write_per_req_slice(
         req_to_token_pool.write_c128,
         req_pool_indices_cpu,
@@ -167,7 +166,7 @@ def maybe_write_dsv4_decode(
     token_per_req: int,
 ) -> None:
     """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
-    the per-req table on DSV4NPUReqToTokenPool.
+    the per-req sidecar on DSV4NPUReqToTokenPool.
 
     ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
     ``token_per_req``); the new compressed tokens go at positions
@@ -195,6 +194,7 @@ def maybe_write_dsv4_decode(
         ratio=128,
     )
 
+
 def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     """Build the DSV4 cache-location view for one target-verify pass.
 
@@ -203,7 +203,7 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     the larger allocation bundle produced during decode preparation.
     """
     pool = batch.req_to_token_pool
-    if not hasattr(pool, "req_to_token_c128"):
+    if not hasattr(pool, "req_to_c128_sidecar"):
         return None
     reserve_bundle = batch.out_cache_loc_dsv4
     if reserve_bundle is None:
@@ -218,7 +218,9 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
             start = int(seq_len) // ratio
             end = (int(seq_len) + draft_token_num) // ratio
             if end > start:
-                chunks.append(table[int(req_idx), start:end])
+                positions = torch.arange(start, end, device=table.device)
+                pages = table[int(req_idx), positions // 16]
+                chunks.append(pages * 16 + positions % 16)
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
@@ -229,7 +231,7 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
             out_full_loc
         ),
         out_c4_loc=out_c4_loc,
-        out_c128_loc=flatten_interval(pool.req_to_token_c128, 128),
+        out_c128_loc=flatten_interval(pool.req_to_c128_sidecar, 128),
     )
 
 

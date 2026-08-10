@@ -315,21 +315,21 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
                 result[f"c{ratio}_loc"] = compress_out_loc
 
-            c_table = (
-                req_to_token
-                if ratio == 4
-                else req_to_token_pool.req_to_token_c128
-            )
             # graph: keep shape aligned with the preallocated buffer; eager: clamp >=1 so kernels see a column
             if is_graph:
                 n_c_tokens = seq_lens_max // ratio
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
-            table_tokens = n_c_tokens * ratio if ratio == 4 else n_c_tokens
-            slots = c_table[req_pool_64, :table_tokens]
-            c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
-                torch.int32
-            )
+            if ratio == 4:
+                slots = req_to_token[req_pool_64, : n_c_tokens * ratio]
+                c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
+                    torch.int32
+                )
+            else:
+                n_groups = (n_c_tokens + 15) // 16
+                c_page_table = req_to_token_pool.req_to_c128_sidecar[
+                    req_pool_64, :n_groups
+                ].to(torch.int32)
             result[f"c{ratio}_page_table"] = c_page_table
 
         if is_decode:
@@ -771,9 +771,10 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     // ratio
                 ).to(torch.int32)
             else:
-                write_locs = self.req_to_token_pool.req_to_token_c128[
-                    req_pool_flat, pos_in_req_flat
-                ].to(torch.int32)
+                page_ids = self.req_to_token_pool.req_to_c128_sidecar[
+                    req_pool_flat, pos_in_req_flat // 16
+                ]
+                write_locs = (page_ids * 16 + pos_in_req_flat % 16).to(torch.int32)
             self._compressor_epilog_npu(
                 compressor, kv_out, forward_batch, override_loc=write_locs
             )
@@ -1755,13 +1756,11 @@ class DeepseekV4AscendAttnBackend(
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
-        expected_cmp_page_size = (
-            ori_page_size // 4 if compress_ratio == 4 else ori_page_size
-        )
+        expected_cmp_page_size = ori_page_size // 4 if compress_ratio == 4 else 16
         assert cmp_native_page_size == expected_cmp_page_size, (
             f"c{compress_ratio} page_size={cmp_native_page_size} != "
             f"expected={expected_cmp_page_size} for ori page_size={ori_page_size}; "
-            "C4 must use its native page and C128 must keep the global page "
+            "C4 must use its native page and C128 must use a 16-slot sidecar "
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
