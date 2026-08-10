@@ -55,6 +55,11 @@ class _Allocator(SWATokenToKVPoolAllocator):
 
 
 class _ReqPool:
+    def __init__(self):
+        self.req_to_c128_sidecar = torch.tensor(
+            [[11, 12, 13]], dtype=torch.int64
+        )
+
     def set_c128_prefix_pages(self, req, page_ids):
         req.matched_c128_pages = page_ids.clone()
 
@@ -128,6 +133,68 @@ class TestC128SidecarComponent(unittest.TestCase):
         self.assertEqual(partial_pages.tolist(), [11])
         self.assertEqual(len(full.device_indices), 4096)
         self.assertEqual(full_pages.tolist(), [11, 12])
+
+    def test_eagle_cache_length_uses_complete_logical_groups(self):
+        component = self.cache.components[ComponentType.C128]
+        self.cache.tree_core.is_eagle = True
+        req = SimpleNamespace(req_pool_idx=0)
+
+        for raw_len, expected_len, expected_pages in (
+            (2048, 0, []),
+            (2049, 2049, [11]),
+            (4096, 2049, [11]),
+            (4097, 4097, [11, 12]),
+        ):
+            with self.subTest(raw_len=raw_len):
+                params = InsertParams()
+                cache_len = component.prepare_for_caching_req(
+                    req=req,
+                    insert_params=params,
+                    token_ids_len=raw_len,
+                    is_finished=False,
+                )
+                self.assertEqual(cache_len, expected_len)
+                self.assertEqual(params.c128_value.tolist(), expected_pages)
+
+    def test_non_eagle_cache_length_is_unchanged(self):
+        component = self.cache.components[ComponentType.C128]
+        params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=SimpleNamespace(req_pool_idx=0),
+            insert_params=params,
+            token_ids_len=4096,
+            is_finished=False,
+        )
+
+        self.assertEqual(cache_len, 4096)
+        self.assertEqual(params.c128_value.tolist(), [11, 12])
+
+    def test_eagle_partial_second_group_stays_out_of_radix(self):
+        component = self.cache.components[ComponentType.C128]
+        self.cache.tree_core.is_eagle = True
+        token_ids = array("q", range(4096))
+        params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=SimpleNamespace(req_pool_idx=0),
+            insert_params=params,
+            token_ids_len=len(token_ids),
+            is_finished=False,
+        )
+        key = RadixKey(token_ids[:cache_len], is_bigram=True).page_aligned(128)
+        params.key = key
+        params.value = torch.arange(len(key))
+        self.cache.insert(params)
+
+        result, pages = self._match(token_ids)
+        self.cache.inc_lock_ref(result.last_device_node)
+
+        self.assertEqual(len(result.device_indices), 2048)
+        self.assertEqual(pages.tolist(), [11])
+        self.assertEqual(self.cache.total_size(), (2048, 1))
+        self.assertEqual(self.cache.protected_size(), 2048)
+        self.assertEqual(self.cache.evictable_size(), 0)
 
     def test_branch_after_complete_group_shares_only_complete_page(self):
         first = array("q", range(4096))
