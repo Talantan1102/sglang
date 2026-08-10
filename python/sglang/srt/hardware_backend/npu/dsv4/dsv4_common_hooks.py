@@ -81,8 +81,9 @@ def dsv4_state_payloads(
     prefix_len = max(0, min(int(prefix_len), seq_len))
 
     def c128_kv_pages():
-        lo = prefix_len // 2048
-        hi = (seq_len // 128 + 15) // 16
+        c128_page_size = req_to_token_pool.c128_page_size
+        lo = prefix_len // (128 * c128_page_size)
+        hi = (seq_len // 128 + c128_page_size - 1) // c128_page_size
         if hi <= lo:
             return np.empty((0,), dtype=np.int32)
         pages = (
@@ -213,14 +214,15 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     seq_lens = batch.seq_lens_cpu.tolist()
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
+        page_size = pool.c128_page_size
         chunks = []
         for req_idx, seq_len in zip(req_indices, seq_lens):
             start = int(seq_len) // ratio
             end = (int(seq_len) + draft_token_num) // ratio
             if end > start:
                 positions = torch.arange(start, end, device=table.device)
-                pages = table[int(req_idx), positions // 16]
-                chunks.append(pages * 16 + positions % 16)
+                pages = table[int(req_idx), positions // page_size]
+                chunks.append(pages * page_size + positions % page_size)
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
