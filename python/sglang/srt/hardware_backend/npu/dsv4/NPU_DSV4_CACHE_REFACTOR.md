@@ -1000,7 +1000,7 @@ flowchart LR
 
 本节不是改动一、改动二的汇总：第 6 节已经汇总两项重构的最终结构；第 7 节描述后续 Prefix Cache 工作，其中 7.1 给出单机总体目标，7.2 展开 C128 KV 的专项设计，7.3 再把单机方案扩展到 PD 分离。
 
-> 实现状态（2026-08-07）：7.1/7.2 的单机 sidecar、Eager、Graph/MTP 和 Unified Radix 生命周期已完成代码接入；7.3 的 Decode 侧 Prefix Cache 增量传输仍未实施，`total_prefix_len != 0` 的原有限制继续保留。
+> 实现状态（2026-08-10）：7.1/7.2 的单机 sidecar、Eager、Graph/MTP 和 Unified Radix 生命周期已完成代码接入；7.3 已复用现有分配和回收流程完成 Decode 侧 Prefix Cache 最小适配，真实双机 NPU、PP/MTP 和长稳验证仍待完成。
 
 ### 7.1 单机 Prefix Cache 总体目标
 
@@ -1104,14 +1104,14 @@ PD 与单机混部的根本区别是：Prefill 和 Decode 拥有各自的物理 
 
 #### 7.3.2 State 解决后的剩余工作
 
-Compressor state 正确交接后没有新的计算语义障碍，剩余工作是 Prefix Cache 的地址、增量和生命周期管理：
+Compressor state 正确交接后没有新的计算语义障碍，Prefix Cache 的地址、增量和生命周期按以下方式复用现有流程：
 
-1. **Decode 本地分配**：为 Prefill 将要传输的增量分配 Full/SWA 页和 C128 sidecar page，构造 source index→destination index 的位置配对，不复用 Prefill 物理 loc。
-2. **命中与增量拼接**：保留 Decode 已命中的 Full/SWA/C4/Indexer/C128 数据，只传输 Prefix Cache 命中长度之后的 Prefill 增量，并保证增量写入不污染共享前缀页。
-3. **C128 sidecar 恢复**：Decode 为 Full logical group 分配本地 C128 page，恢复 group→page 映射。完整 group 可作为冻结缓存页共享；Prefix Cache 命中边界之后、PD 最终交接点之前形成的未满 group，只传输已产生的有效 C128 slot 到 Decode request-private tail，后续原地追加且不进入 Prefix Cache。
-4. **原子发布与回滚**：所有必要组件传输成功后才发布 Prefix Cache 条目；任一传输失败、请求取消或超时都要释放新分配的 Full/SWA/C128 资源和 transfer 引用。
-5. **组合验证**：覆盖跨实例完整/增量传输、C128 完整/未满 group、PP 分层、MTP/NextN、传输后继续 decode、淘汰和物理页复用。
+1. **Decode 本地分配（已复用）**：沿用 `_pre_alloc()` 和 DSV4 allocator；Radix 命中的 C128 page 由 sidecar component 安装到 Decode request，增量 C128 page 由现有 `alloc_extend()` 在 Decode pool 本地分配。
+2. **命中与增量拼接（已适配）**：主 KV 沿用公共 PD 增量区间；SWA/C4 state 和 C128 KV page 都从 `decode_prefix_len` 之后构造 source/destination index，不覆盖 Decode 已命中的共享前缀。
+3. **C128 sidecar 恢复（已复用）**：`dsv4_unwrap_prealloc()` 将 Decode 新分配的 C128 page 登记到 `req_to_c128_sidecar`；完整命中 group 与 request-private tail 继续使用 7.2 的同一套映射和引用计数。
+4. **原子发布与回滚（已复用）**：传输成功前 request 持有新分配资源但不发布 Radix 条目；失败、取消和超时继续走 `release_kv_cache()`，统一释放 Full/SWA/C128 request 引用。
+5. **组合验证（进行中）**：CPU 定向测试覆盖 C128 page 增量过滤；仍需覆盖真实跨实例传输、C128 完整/未满 group、PP 分层、MTP/NextN、传输后继续 decode、淘汰和物理页复用。
 
-当前 NPU DSV4 PD 的直接缺口是 Decode 侧 Prefix Cache：`decode.py` 在 `total_prefix_len != 0` 时仍主动报错。后续实现上述本地分配、增量拼接和 sidecar 生命周期后，才能移除该限制。
+最小实现只新增 Prefill 侧 `decode_prefix_len` 记录，并让 Prefill/Decode 使用同一命中边界生成增量 state index；没有新增 PD allocator、request table 或 sidecar 数据结构。`decode.py` 中两处 DSV4 `total_prefix_len != 0` 限制已经删除。
 
-> 当前代码索引：[C4 state 随 SWA component 注册](dsv4_memory_pool.py#L353-L377) · [C128 state 交接边界判断](../../../disaggregation/utils.py#L81-L97) · [Decode 侧 Prefix Cache 限制](../../../disaggregation/decode.py#L1207-L1215)
+> 当前代码索引：[C4 state 随 SWA component 注册](dsv4_memory_pool.py#L353-L377) · [C128 state 交接边界判断](../../../disaggregation/utils.py#L81-L97) · [Decode 增量 state index](../../../disaggregation/decode.py#L1135-L1210) · [Prefill 增量 state index](../../../disaggregation/prefill.py#L1146-L1228)

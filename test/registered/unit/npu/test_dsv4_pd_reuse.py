@@ -174,6 +174,24 @@ class TestDSV4PDReuse(unittest.TestCase):
             np.array([2, 4], dtype=np.int32),
         )
 
+    def test_c128_kv_payload_only_contains_decode_delta(self):
+        req_pool = SimpleNamespace(
+            req_to_c128_sidecar=torch.tensor([[2, 3, 4]], dtype=torch.int32)
+        )
+
+        payloads = dsv4_state_payloads(
+            req_pool,
+            req_pool_idx=0,
+            seq_len=4300,
+            page_size=128,
+            prefix_len=2048,
+        )
+
+        np.testing.assert_array_equal(
+            payloads[AscendStateType.DSV4_C128](),
+            np.array([3, 4], dtype=np.int32),
+        )
+
     def test_pp_mapping_reuses_gpu_state_layout(self):
         manager = object.__new__(AscendKVManager)
         manager.kv_args = SimpleNamespace(
