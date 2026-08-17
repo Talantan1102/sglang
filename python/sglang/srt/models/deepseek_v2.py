@@ -607,6 +607,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
